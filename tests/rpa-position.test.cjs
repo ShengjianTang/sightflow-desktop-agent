@@ -9,7 +9,11 @@ function layoutApi(info = () => ({ bounds, scaleFactor: 1.5 })) {
   return loadSource('src/core/rpa/vision-utils.ts', {
     './window-utils': { getWindowInfo: async () => info(), getWindowInfoSync: info },
     './screenshot-utils': {
-      captureWechatWindow: async () => ({ success: true, bounds, screenshotBase64: 'frame' })
+      captureWechatWindow: async () => ({
+        success: true,
+        bounds: info().bounds,
+        screenshotBase64: 'frame'
+      })
     }
   })
 }
@@ -71,6 +75,38 @@ test('layout inference captures the actual input box and replaces stale cached i
   await api.detectWechatLayout({ detectVision: async () => boxes }, 'wechat')
   assert.ok(api.getInputAreaFromCache('wechat').coordinates[1] > 500)
   assert.equal(api.getInputAreaFromCache('wechat').source, undefined)
+})
+
+test('bubble-cropped history does not force a second vision call for a verified editor', async () => {
+  const api = layoutApi(() => ({ bounds: { x: 0, y: 0, width: 880, height: 530 }, scaleFactor: 1 }))
+  let calls = 0
+  const boxes =
+    '<bbox>87,80,283,134</bbox><bbox>342,76,647,154</bbox>' +
+    '<bbox>343,171,660,708</bbox><bbox>350,720,840,849</bbox>'
+  const result = await api.detectWechatLayout(
+    { detectVision: async () => (calls++, boxes) },
+    'wechat'
+  )
+  assert.equal(result.success, true)
+  assert.equal(calls, 1)
+  assert.deepEqual(api.getInputAreaFromCache('wechat').bbox, [350, 720, 840, 849])
+  assert.deepEqual(api.getLayoutCache('wechat').chatMainArea.bbox, [343, 171, 840, 708])
+})
+
+test('unrelated editor remains blocked when it does not overlap the chat panel', async () => {
+  const api = layoutApi()
+  const boxes =
+    '<bbox>70,20,300,80</bbox><bbox>320,20,660,90</bbox>' +
+    '<bbox>320,100,660,650</bbox><bbox>700,730,950,920</bbox>'
+  let calls = 0
+  const result = await api.detectWechatLayout(
+    { detectVision: async () => (calls++, calls === 1 ? boxes : '[NO_CHAT_INPUT]') },
+    'wechat'
+  )
+  assert.equal(result.success, false)
+  assert.equal(result.recoverable, true)
+  assert.equal(calls, 2)
+  assert.equal(api.getLayoutCache('wechat'), null)
 })
 
 test('overlapping chat/editor boxes trim history instead of aborting startup', async () => {

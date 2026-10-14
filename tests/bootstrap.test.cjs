@@ -234,6 +234,111 @@ test('RPA startup only requests the required chat layout', async () => {
   assert.equal(unreadCalls, 0)
 })
 
+test('opening an unread chat proceeds through layout, text/image analysis and one reply', async () => {
+  const bounds = { x: 27, y: 229, width: 938, height: 530 }
+  const vision = loadSource('src/core/rpa/vision-utils.ts', {
+    './window-utils': {
+      getWindowInfo: async () => ({ bounds, scaleFactor: 1 }),
+      getWindowInfoSync: () => ({ bounds, scaleFactor: 1 })
+    },
+    './screenshot-utils': {
+      captureWechatWindow: async () => ({ success: true, bounds, screenshotBase64: 'frame' })
+    }
+  })
+  const { createSiliconFlowProvider } = loadSource('src/main/siliconflow-provider.ts', {
+    '../core/siliconflow-client': {}
+  })
+  const messages = [
+    { sender: 'incoming', kind: 'text', text: '兄弟们上号上号', senderBbox: [360, 210, 400, 250] },
+    { sender: 'incoming', kind: 'image', text: '游戏截图', senderBbox: [360, 380, 400, 430] }
+  ]
+  let layoutCalls = 0
+  const clicks = [],
+    sends = [],
+    analyses = [],
+    queue = [],
+    logs = []
+  const provider = createSiliconFlowProvider({
+    analyzeImage: async (image, prompt) => {
+      analyses.push({ image, prompt })
+      return JSON.stringify({
+        action: 'reply',
+        reason: 'incoming',
+        reply: '好，看到游戏截图了，这就上号！',
+        messages,
+        latestMessage: '游戏截图',
+        sender: 'incoming',
+        senderBbox: [360, 380, 400, 430]
+      })
+    }
+  })
+  const device = {
+    setAppType() {
+      return undefined
+    },
+    clearChatBaseline() {
+      return undefined
+    },
+    measureLayout: () =>
+      vision.detectWechatLayout(
+        {
+          detectVision: async () =>
+            ++layoutCalls === 1
+              ? '[EMPTY_CHAT]'
+              : '<bbox>87,80,283,134</bbox><bbox>342,76,647,154</bbox>' +
+                '<bbox>343,171,660,708</bbox><bbox>350,720,840,849</bbox>'
+        },
+        'wechat'
+      ),
+    hasUnreadMessage: async () => ({ hasUnread: true, unreadContactCoords: [125, 376] }),
+    clickUnreadContact: async (coords) => clicks.push(coords),
+    screenshot: async () => 'frame',
+    getCaptureContext: () => 'full_window',
+    getObservationContext: () => ({
+      conversationId: 'fixture-group',
+      historyId: 'new-text-and-image',
+      chatAreaBbox: vision.getLayoutCache('wechat').chatMainArea.bbox
+    }),
+    sendMessage: async (text) => sends.push(text),
+    commitObservationBaseline: () => true
+  }
+  const session = new GenericChannelSession(device)
+  const ctx = {
+    appType: 'wechat',
+    state: createInitialGenericChannelState(),
+    host: {
+      isRunning: () => true,
+      enqueue: (event) => queue.push(event),
+      schedule() {
+        throw new Error('should reach reply without retry')
+      },
+      log: (_, message) => logs.push(message),
+      trace() {
+        return undefined
+      },
+      stopSession() {
+        throw new Error('engine should stay running')
+      },
+      runProvider: (input) => provider.run(input)
+    }
+  }
+  await session.onStart(ctx)
+  await session.onEvent(queue.shift(), ctx) // Empty page opens the detected contact.
+  await session.onEvent(queue.shift(), ctx) // Measure the opened chat, without an editor recheck.
+  await session.onEvent(queue.shift(), ctx) // Read messages and request a reply.
+  await new Promise(setImmediate)
+  while (queue.length && queue[0].type !== 'check_unread') {
+    await session.onEvent(queue.shift(), ctx)
+  }
+  assert.deepEqual(clicks, [[125, 376]])
+  assert.equal(layoutCalls, 2)
+  assert.equal(analyses.length, 1)
+  assert.match(analyses[0].prompt, /连续文字、图片/)
+  assert.deepEqual(sends, ['好，看到游戏截图了，这就上号！'])
+  assert.equal(queue[0].type, 'check_unread')
+  assert.ok(logs.some((message) => /识别聊天内容/.test(message)))
+})
+
 test('failed optional unread detection cools down and resets on session cleanup', async (t) => {
   t.mock.method(console, 'error', () => {})
   let now = 1000

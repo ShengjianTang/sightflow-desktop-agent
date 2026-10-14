@@ -518,7 +518,7 @@ const LAYOUT_DETECT_PROMPTS: Record<'wechat' | 'wework', { prompt: string; targe
 帮我按顺序框选以下四个区域，每个区域用 <bbox>x1,y1,x2,y2</bbox> 格式，坐标范围 0-1000：
 1. 【搜索输入框】— 聊天联系人列表顶部的搜索栏
 2. 【对话窗口header区域】— 对话区域最顶上一条，显示当前对话人的名称
-3. 【聊天记录区】— 对话区域中间部分，显示历史聊天气泡的区域，不包含输入框和工具栏
+3. 【聊天记录区】— 右侧完整聊天面板的历史区域，从左侧会话列表的分隔线一直到右侧面板边缘，不要只框住现有气泡、图片或头像；不包含输入框和工具栏
 4. 【消息文字输入框】— 底部可编辑文字的空白区域，不包含表情/文件工具栏、发送按钮和窗口边框；若无法确认请不输出第4个框
 若左侧是聊天列表，右侧只有空白微信占位标志、尚未选择聊天，只输出 [EMPTY_CHAT]。公众号文章、网页、订阅号列表或其他没有可编辑聊天输入框的页面只输出 [NO_CHAT_INPUT]，不要猜测输入框。`,
     targets: ['【搜索输入框】', '【对话窗口header区域】', '【聊天记录区】', '【消息文字输入框】']
@@ -534,7 +534,7 @@ const LAYOUT_DETECT_PROMPTS: Record<'wechat' | 'wework', { prompt: string; targe
 帮我按顺序框选以下四个区域，每个区域用 <bbox>x1,y1,x2,y2</bbox> 格式，坐标范围 0-1000：
 1. 【搜索输入框】— 中间消息列表顶部的搜索栏
 2. 【右侧聊天区顶部】— 右侧聊天区最顶上一条，显示当前聊天人/群名
-3. 【聊天记录区】— 右侧聊天区中间部分，显示聊天气泡的区域，不包含输入框和工具栏
+3. 【聊天记录区】— 右侧完整聊天面板的历史区域，从会话列表分隔线一直到右侧面板边缘，不要只框住气泡、图片或头像；不包含输入框和工具栏
 4. 【消息文字输入框】— 底部可编辑文字的空白区域，不包含表情/文件工具栏、发送按钮和窗口边框；若无法确认请不输出第4个框
 若左侧是消息列表，右侧为空白占位标志、尚未选择聊天，只输出 [EMPTY_CHAT]。公众号文章、网页、订阅号列表或其他没有可编辑聊天输入框的页面只输出 [NO_CHAT_INPUT]，不要猜测输入框。`,
     targets: ['【搜索输入框】', '【右侧聊天区顶部】', '【聊天记录区】', '【消息文字输入框】']
@@ -544,6 +544,10 @@ const LAYOUT_DETECT_PROMPTS: Record<'wechat' | 'wework', { prompt: string; targe
 export function isUsableMessageInput(input: BBox, chat: BBox, windowHeight: number): boolean {
   const centerX = (input[0] + input[2]) / 2
   const centerY = (input[1] + input[3]) / 2
+  // Models sometimes crop the history box around visible bubbles while the
+  // editor extends farther right. Require a shared panel and a center inside
+  // the history box, but do not mistake that cropped right edge for a wall.
+  const overlap = Math.min(input[2], chat[2]) - Math.max(input[0], chat[0])
   return (
     input[2] - input[0] >= 60 &&
     ((input[3] - input[1]) / 1000) * windowHeight >= 12 &&
@@ -553,7 +557,7 @@ export function isUsableMessageInput(input: BBox, chat: BBox, windowHeight: numb
     centerX >= chat[0] &&
     centerX <= chat[2] &&
     input[0] >= chat[0] - 100 &&
-    input[2] <= chat[2] + 100
+    overlap >= 0.6 * Math.min(input[2] - input[0], chat[2] - chat[0])
   )
 }
 
@@ -658,6 +662,13 @@ export async function detectWechatLayout(
         }
       }
       inputBbox = verifiedBoxes[0]
+    }
+    // The same accepted editor provides independent evidence that the right
+    // panel continues past a bubble-cropped history box. Include that visible
+    // portion in history/diff/self-bubble checks; never extrapolate to the
+    // full window width or use the editor as a click target without validation.
+    if (inputBbox && bboxes[2][2] < inputBbox[2]) {
+      bboxes[2] = [bboxes[2][0], bboxes[2][1], inputBbox[2], bboxes[2][3]]
     }
     // A VLM often includes the toolbar/input top in chatMain. Trust a valid editor
     // separately and trim the history ROI instead of rejecting the entire startup.
