@@ -5,7 +5,7 @@ export async function runScreenshotTest() {
   console.log('[Test] Running screenshot atom...')
   const device = new RPADevice()
   device.setAppType('wechat')
-  
+
   try {
     const screenshotStr = await device.screenshot()
     const base64Data = screenshotStr.replace(/^data:image\/\w+;base64,/, '')

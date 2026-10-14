@@ -19,7 +19,10 @@ interface ScreenshotCache {
 
 const screenshotCache = new Map<string, ScreenshotCache>()
 const screenshotPendingPromises = new Map<string, Promise<ScreenshotCache | null>>()
-const SCREENSHOT_CACHE_DURATION = 100 // 100ms
+// RPADevice clears at the start of every poll and after actions. This short
+// window is enough for local PNG diff + badge scans to share one desktop frame.
+const SCREENSHOT_CACHE_DURATION = 500
+let captureEpoch = 0
 
 function getCropHash(crop?: { x: number; y: number; width: number; height: number }): string {
   if (!crop) return 'no-crop'
@@ -31,6 +34,11 @@ function getScreenshotCacheKey(
   crop?: { x: number; y: number; width: number; height: number }
 ): string {
   return `${displayId}-${getCropHash(crop)}`
+}
+
+export function clearScreenshotCache(): void {
+  captureEpoch++
+  screenshotCache.clear()
 }
 
 export function getChatContactAvatarBounds(): {
@@ -85,7 +93,7 @@ export async function calculateRedDotPercentage(
       }
     }
     return (redPixelCount / totalPixels) * 100
-  } catch (error) {
+  } catch {
     return null
   }
 }
@@ -103,14 +111,38 @@ export async function captureWechatWindow(
       bounds,
       display: { scaleFactor }
     } = windowCoreResult
-    const cacheKey = getScreenshotCacheKey(display.id, crop)
+    const epoch = captureEpoch
+    const cacheKey = `${epoch}-${appType}-${scaleFactor}-${getCropHash(bounds)}-${getScreenshotCacheKey(display.id, crop)}`
+
+    // One full frame per poll; chat diff and unread scans crop that same frame.
+    // Capturing the desktop separately for every tiny ROI was the expensive part.
+    if (crop) {
+      const full = await captureWechatWindow(appType)
+      if (!full.success || !full.nativeImage) return full
+      const x = Math.max(0, Math.floor(crop.x * scaleFactor))
+      const y = Math.max(0, Math.floor(crop.y * scaleFactor))
+      const size = full.nativeImage.getSize()
+      const width = Math.min(size.width, Math.ceil((crop.x + crop.width) * scaleFactor)) - x
+      const height = Math.min(size.height, Math.ceil((crop.y + crop.height) * scaleFactor)) - y
+      if (width <= 0 || height <= 0) return { success: false, error: '截图区域超出窗口范围' }
+      const nativeImage = full.nativeImage.crop({ x, y, width, height })
+      return {
+        ...full,
+        nativeImage,
+        screenshotBase64: nativeImage.toDataURL(),
+        bounds: {
+          x: bounds.x + x / scaleFactor,
+          y: bounds.y + y / scaleFactor,
+          width: width / scaleFactor,
+          height: height / scaleFactor
+        }
+      }
+    }
 
     const cached = screenshotCache.get(cacheKey)
     const now = Date.now()
     if (cached && now - cached.timestamp < SCREENSHOT_CACHE_DURATION) {
-      const resultBounds = crop
-        ? { x: bounds.x + crop.x, y: bounds.y + crop.y, width: crop.width, height: crop.height }
-        : bounds
+      const resultBounds = bounds
       console.log('[captureWechatWindow] 命中缓存:', {
         appType,
         cacheKey,
@@ -128,14 +160,22 @@ export async function captureWechatWindow(
       }
     }
 
+    const pending = screenshotPendingPromises.get(cacheKey)
+    if (pending) {
+      const result = await pending
+      return result ? { success: true, ...result } : { success: false, error: '截图失败' }
+    }
+    // Bound obsolete geometry entries during continuous window dragging.
+    if (screenshotCache.size > 20) screenshotCache.clear()
     const capturePromise = (async (): Promise<ScreenshotCache | null> => {
       try {
         const physicalWidth = Math.round(display.bounds.width * scaleFactor)
         const physicalHeight = Math.round(display.bounds.height * scaleFactor)
 
         // Add a timeout to desktopCapturer.getSources to prevent deadlocks
+        let timeout: ReturnType<typeof setTimeout> | undefined
         const timeoutPromise = new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('desktopCapturer timeout')), 5000)
+          timeout = setTimeout(() => reject(new Error('desktopCapturer timeout')), 5000)
         })
 
         const screenSources = (await Promise.race([
@@ -144,40 +184,24 @@ export async function captureWechatWindow(
             thumbnailSize: { width: physicalWidth, height: physicalHeight }
           }),
           timeoutPromise
-        ])) as Electron.DesktopCapturerSource[]
+        ]).finally(() => clearTimeout(timeout))) as Electron.DesktopCapturerSource[]
 
-        const matchedScreenSource =
-          screenSources.find((s) => String(s.display_id) === String(display.id)) || screenSources[0]
+        const matchedScreenSource = screenSources.find(
+          (s) => String(s.display_id) === String(display.id)
+        )
         if (!matchedScreenSource) return null
 
-        let cropRect = {
+        const cropRect = {
           x: Math.round((bounds.x - display.bounds.x) * scaleFactor),
           y: Math.round((bounds.y - display.bounds.y) * scaleFactor),
           width: Math.round(bounds.width * scaleFactor),
           height: Math.round(bounds.height * scaleFactor)
         }
 
-        if (crop) {
-          const cropPhysical = {
-            x: Math.round(crop.x * scaleFactor),
-            y: Math.round(crop.y * scaleFactor),
-            width: Math.round(crop.width * scaleFactor),
-            height: Math.round(crop.height * scaleFactor)
-          }
-          cropRect = {
-            x: Math.round(cropRect.x + cropPhysical.x),
-            y: Math.round(cropRect.y + cropPhysical.y),
-            width: cropPhysical.width,
-            height: cropPhysical.height
-          }
-        }
-
         const croppedNativeImage = matchedScreenSource.thumbnail.crop(cropRect)
         const croppedScreenshot = croppedNativeImage.toDataURL()
 
-        const resultBounds = crop
-          ? { x: bounds.x + crop.x, y: bounds.y + crop.y, width: crop.width, height: crop.height }
-          : bounds
+        const resultBounds = bounds
         const cacheResult: ScreenshotCache = {
           screenshotBase64: croppedScreenshot,
           nativeImage: croppedNativeImage,
@@ -185,7 +209,7 @@ export async function captureWechatWindow(
           display,
           timestamp: Date.now()
         }
-        screenshotCache.set(cacheKey, cacheResult)
+        if (captureEpoch === epoch) screenshotCache.set(cacheKey, cacheResult)
         return cacheResult
       } catch (error) {
         console.error('Screenshot capture error:', error)

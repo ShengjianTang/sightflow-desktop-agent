@@ -74,15 +74,7 @@ function rectFromPointer(p: PointerState): ScreenRect {
   }
 }
 
-declare global {
-  interface Window {
-    electron?: {
-      on: (channel: string, callback: (...args: unknown[]) => void) => () => void
-      send: (channel: string, ...args: unknown[]) => void
-      invoke: (channel: string, ...args: unknown[]) => Promise<unknown>
-    }
-  }
-}
+// The preload Window API is declared once in src/preload/index.d.ts.
 
 // Mini schematic of the IM window layout, sitting in the wizard header.
 // Three small cells (left contact list, top-right chat area, bottom-right
@@ -105,9 +97,7 @@ function LayoutPreview({
     return 'done'
   }
   const cell = (key: WizardStepKey, modifier: string): React.JSX.Element => (
-    <div
-      className={`overlay__layout-cell overlay__layout-cell--${modifier} is-${stateOf(key)}`}
-    />
+    <div className={`overlay__layout-cell overlay__layout-cell--${modifier} is-${stateOf(key)}`} />
   )
   return (
     <div className="overlay__layout-preview" aria-hidden>
@@ -314,9 +304,7 @@ export function OverlayApp(): React.ReactElement {
             </div>
             <svg
               className={
-                isInput
-                  ? 'overlay__crosshair overlay__crosshair--input'
-                  : 'overlay__crosshair'
+                isInput ? 'overlay__crosshair overlay__crosshair--input' : 'overlay__crosshair'
               }
               style={{ left: cx, top: cy }}
               viewBox="0 0 24 24"

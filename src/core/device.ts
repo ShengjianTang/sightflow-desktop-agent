@@ -11,6 +11,7 @@
 
 import { AppType } from './rpa/types'
 import { BBox } from './rpa/vision-utils'
+import type { ChatObservation } from './session-types'
 
 export interface DesktopDevice {
   // ── 配置 ──
@@ -29,19 +30,33 @@ export interface DesktopDevice {
    * 启动时一次性布局测量。
    * VLM / box-select 都产出统一 LayoutCache，后续截图、diff、发送只消费 LayoutCache。
    */
-  measureLayout(): Promise<{ success: boolean; error?: string }>
+  measureLayout(): Promise<{
+    success: boolean
+    error?: string
+    recoverable?: boolean
+    canOpenUnread?: boolean
+  }>
 
   /** 全窗口截图 → base64 */
   screenshot(): Promise<string>
+  captureStableScreenshot?(isRunning: () => boolean): Promise<string>
+  getCaptureContext?(): 'full_window' | 'chat_area'
+  /** Identity and geometry from the exact screenshot supplied to the Provider. */
+  getObservationContext?(): ChatObservation | undefined
+  /** Commit the analyzed frame, so messages arriving during inference stay detectable. */
+  commitObservationBaseline?(): boolean
 
   /**
    * Step 1 粗检测：聊天入口是否有红点？
    * 内部流程: 定位 chatEntranceArea / contactList → 局部 crop → 红点像素扫描。
    * 缺少未读切换位置时返回无未读，session 会回到 chatMain diff 轮询。
    */
-  hasUnreadMessage(): Promise<{
+  hasUnreadMessage(onProgress?: (message: string) => void): Promise<{
     hasUnread: boolean
     chatEntranceArea?: { bbox: BBox; coordinates: [number, number] }
+    unreadContactCoords?: [number, number]
+    detail?: string
+    error?: string
   }>
 
   /**
@@ -71,7 +86,12 @@ export interface DesktopDevice {
    * 检查 chatMainArea 是否有变化（和 baseline 对比）
    * 发现变化说明当前对话有新消息进来
    */
-  hasChatAreaChanged(): Promise<{ hasDiff: boolean; hasBaseline: boolean }>
+  hasChatAreaChanged(): Promise<{
+    hasDiff: boolean
+    hasBaseline: boolean
+    error?: string
+    needsLayout?: boolean
+  }>
 
   /**
    * 清除 diff baseline

@@ -11,8 +11,14 @@
  */
 import * as http from 'http'
 
-const PRIMARY_PORT = 12680
-const FALLBACK_PORT = 12681
+const DEFAULT_PRIMARY_PORT = 12680
+
+function readPort(value: string | undefined, fallback: number): number {
+  const port = Number(value)
+  return Number.isInteger(port) && port >= 1024 && port <= 65535 ? port : fallback
+}
+
+const PRIMARY_PORT = readPort(process.env.SIGHTFLOW_SKILL_PORT, DEFAULT_PRIMARY_PORT)
 
 export type SkillStartReason =
   | 'no_vision_key'
@@ -20,6 +26,7 @@ export type SkillStartReason =
   | 'missing_required_field'
   | 'engine_failed'
   | 'already_running'
+  | 'operation_in_progress'
   | 'wizard_cancelled'
 
 export type SkillPauseReason = 'not_running' | 'pause_failed'
@@ -47,6 +54,7 @@ export interface SkillEngineController {
 
 let server: http.Server | null = null
 let controller: SkillEngineController | null = null
+let startPromise: Promise<number | null> | null = null
 
 /** 并发锁：同一时间只能有一个 start/pause 操作 */
 let skillOperationLock = false
@@ -84,6 +92,7 @@ function readBody(req: http.IncomingMessage): Promise<string> {
 
 const START_STATUS_MAP: Record<SkillStartReason, number> = {
   already_running: 409,
+  operation_in_progress: 409,
   no_vision_key: 400,
   no_provider: 400,
   missing_required_field: 400,
@@ -214,49 +223,64 @@ async function requestHandler(req: http.IncomingMessage, res: http.ServerRespons
   }
 }
 
-export function startSkillServer(engineController: SkillEngineController): void {
-  if (server) {
-    console.warn('[Skill Server] already started, skip')
-    return
-  }
+/** Returns the actual port, or null when neither port is available. */
+export function startSkillServer(
+  engineController: SkillEngineController,
+  primaryPort = PRIMARY_PORT
+): Promise<number | null> {
+  if (startPromise) return startPromise
   controller = engineController
-
-  server = http.createServer((req, res) => {
+  const candidate = http.createServer((req, res) => {
     requestHandler(req, res).catch((error) => {
       console.error('[Skill Server] Unhandled error:', error)
-      try {
+      if (!res.headersSent && !res.destroyed) {
         jsonResponse(res, 500, { ok: false, error: 'internal_error' })
-      } catch {
-        // response 可能已经发送
       }
     })
   })
+  server = candidate
+  let fallbackAttempted = false
+  const fallbackPort = primaryPort < 65535 ? primaryPort + 1 : DEFAULT_PRIMARY_PORT
 
-  server.on('error', (err: NodeJS.ErrnoException) => {
-    if (err.code === 'EADDRINUSE' && server) {
-      console.warn(
-        `[Skill Server] 端口 ${PRIMARY_PORT} 被占用，尝试 fallback 端口 ${FALLBACK_PORT}`
-      )
-      server.listen(FALLBACK_PORT, '127.0.0.1', () => {
-        console.log(`[Skill Server] 已启动，监听 http://127.0.0.1:${FALLBACK_PORT}`)
-      })
-    } else {
-      console.error('[Skill Server] 启动失败:', err)
-    }
+  startPromise = new Promise((resolve) => {
+    candidate.once('listening', () => {
+      const address = candidate.address()
+      const port = address && typeof address !== 'string' ? address.port : primaryPort
+      console.log(`[Skill Server] 已启动，监听 http://127.0.0.1:${port}`)
+      resolve(port)
+    })
+    candidate.once('close', () => resolve(null))
+    candidate.on('error', (error: NodeJS.ErrnoException) => {
+      if (server !== candidate) {
+        resolve(null)
+        return
+      }
+      if (error.code === 'EADDRINUSE' && !fallbackAttempted) {
+        fallbackAttempted = true
+        console.warn(`[Skill Server] 端口 ${primaryPort} 被占用，尝试 ${fallbackPort}`)
+        candidate.listen(fallbackPort, '127.0.0.1')
+        return
+      }
+      console.error('[Skill Server] 启动失败:', error.message)
+      server = null
+      controller = null
+      startPromise = null
+      skillOperationLock = false
+      candidate.close(() => {})
+      resolve(null)
+    })
+    candidate.listen(primaryPort, '127.0.0.1')
   })
-
-  server.listen(PRIMARY_PORT, '127.0.0.1', () => {
-    console.log(`[Skill Server] 已启动，监听 http://127.0.0.1:${PRIMARY_PORT}`)
-  })
+  return startPromise
 }
 
 export function stopSkillServer(): void {
-  if (server) {
-    server.close(() => {
-      console.log('[Skill Server] 已关闭')
-    })
-    server = null
-  }
+  const closingServer = server
+  server = null
   controller = null
+  startPromise = null
   skillOperationLock = false
+  closingServer?.close(() => {
+    console.log('[Skill Server] 已关闭')
+  })
 }

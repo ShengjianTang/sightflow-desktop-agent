@@ -58,7 +58,7 @@ export class RuntimeHost<TState> {
     }
   }
 
-  async stopSession(_reason?: string): Promise<void> {
+  async stopSession(reason?: string): Promise<void> {
     if (!this.running || this.stopping) return
 
     this.stopping = true
@@ -75,8 +75,12 @@ export class RuntimeHost<TState> {
     } finally {
       this.processingQueue = false
       this.stopping = false
-      this.log('skip', '引擎已停止')
-      this.options.onSessionEnd?.()
+      this.log('skip', reason ? `引擎已停止（${reason}）` : '引擎已停止')
+      try {
+        this.options.onSessionEnd?.()
+      } catch (error) {
+        console.error('[RuntimeHost] onSessionEnd 回调失败:', error)
+      }
     }
   }
 
@@ -163,7 +167,11 @@ export class RuntimeHost<TState> {
       }
     } catch (error: any) {
       this.log('error', error?.message || String(error))
-      await this.stopSession('runtime_error')
+      try {
+        await this.stopSession('runtime_error')
+      } catch (stopError) {
+        this.log('error', stopError instanceof Error ? stopError.message : String(stopError))
+      }
     } finally {
       this.processingQueue = false
     }

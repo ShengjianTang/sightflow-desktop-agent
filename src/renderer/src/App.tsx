@@ -2,6 +2,9 @@ import { useState, useCallback, useRef, useEffect, useMemo } from 'react'
 import { t } from './i18n'
 import logoUrl from './assets/logo.png'
 import MemoryWindow from './MemoryWindow'
+import { ARK_BASE_URL, ARK_MODEL } from '../../core/ai-config'
+import { SILICONFLOW_DEFAULT_MODEL, SILICONFLOW_PROVIDER_ID } from '../../core/siliconflow-client'
+import { TOAST_EVENT, type ToastDetail, showToast } from './toast'
 import './index.css'
 
 interface LogEntry {
@@ -78,7 +81,7 @@ interface InstalledProviderInfo {
   installedAt: string
 }
 
-type ProviderConfigFieldType = 'text' | 'password' | 'url' | 'select' | 'textarea'
+type ProviderConfigFieldType = 'text' | 'password' | 'url' | 'select' | 'textarea' | 'boolean'
 
 interface ProviderConfigField {
   key: string
@@ -88,7 +91,7 @@ interface ProviderConfigField {
   readonly?: boolean
   placeholder?: string
   hint?: string
-  defaultValue?: string
+  defaultValue?: string | boolean
   options?: Array<{ label: string; value: string }>
 }
 
@@ -126,6 +129,11 @@ interface AppSettings {
   appType: AppType
   vision: {
     apiKey: string
+    model: string
+  }
+  siliconFlow: {
+    apiKey: string
+    model: string
   }
   chatProvider: {
     manifestUrl: string
@@ -158,20 +166,40 @@ const BUILTIN_PROVIDER_CATALOG: ProviderCatalogItem[] = [
           label: '模型',
           type: 'text',
           required: true,
-          readonly: true,
-          defaultValue: 'doubao-seed-2-0-lite-260428'
-        },
-        {
-          key: 'baseURL',
-          label: 'Base URL',
-          type: 'url',
-          placeholder: 'https://ark.cn-beijing.volces.com/api/v3'
+          defaultValue: ARK_MODEL
         },
         {
           key: 'systemPrompt',
           label: '系统提示词',
           type: 'textarea',
           placeholder: '你是一个微信自动回复助手。根据截图中的聊天内容，生成合适的回复...'
+        }
+      ]
+    }
+  },
+  {
+    id: SILICONFLOW_PROVIDER_ID,
+    name: '硅基流动多模态',
+    description: '识别聊天截图和图片消息；可在应用内配置密钥与视觉模型。',
+    version: '1.0.0',
+    manifestUrl: 'builtin://siliconflow',
+    capabilities: ['chat'],
+    configSchema: {
+      fields: [
+        {
+          key: 'apiKey',
+          label: 'API Key',
+          type: 'password',
+          placeholder: '输入硅基流动 API Key',
+          hint: '留空时使用启动环境变量 SILICONFLOW_API_KEY（若已设置）'
+        },
+        {
+          key: 'model',
+          label: '视觉模型',
+          type: 'text',
+          required: true,
+          defaultValue: SILICONFLOW_DEFAULT_MODEL,
+          hint: '填写硅基流动平台可用且支持图片输入的模型 ID；不能直接填写火山方舟的豆包 ID'
         }
       ]
     }
@@ -298,6 +326,65 @@ function ControlPanel({
   const [appType, setAppType] = useState<AppType>('wechat')
   const [regions, setRegions] = useState<BoxRegions | null>(null)
   const [openingWizard, setOpeningWizard] = useState(false)
+  const [selectedImage, setSelectedImage] = useState<{ token: string; preview: string } | null>(
+    null
+  )
+  const [imagePrompt, setImagePrompt] = useState('请描述图片中的可见内容。')
+  const [imageResult, setImageResult] = useState('')
+  const [imageBusy, setImageBusy] = useState(false)
+
+  const pickImage = useCallback(async () => {
+    setImageBusy(true)
+    try {
+      const result = await window.electron?.invoke('image:pick')
+      if (result?.success) {
+        setSelectedImage({ token: result.token, preview: result.preview })
+        setImageResult('')
+      } else if (!result?.cancelled) {
+        showToast(result?.error || '无法选择图片', 'error')
+      }
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '无法选择图片', 'error')
+    } finally {
+      setImageBusy(false)
+    }
+  }, [])
+
+  const analyzeImage = useCallback(async () => {
+    if (!selectedImage) return
+    setImageBusy(true)
+    try {
+      const result = await window.electron?.invoke(
+        'image:analyze',
+        selectedImage.token,
+        imagePrompt
+      )
+      if (result?.success) setImageResult(result.text)
+      else showToast(result?.error || '图片识别失败', 'error')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '图片识别失败', 'error')
+    } finally {
+      setImageBusy(false)
+    }
+  }, [selectedImage, imagePrompt])
+
+  const sendSelectedImage = useCallback(async () => {
+    if (!selectedImage || !window.confirm('将图片发送到当前微信/企业微信会话？请确认目标会话。'))
+      return
+    setImageBusy(true)
+    try {
+      const result = await window.electron?.invoke('image:send', selectedImage.token)
+      if (result?.success) {
+        setSelectedImage(null)
+        setImageResult('')
+        showToast('已执行图片粘贴和发送，请在目标聊天窗口核对', 'success')
+      } else showToast(result?.error || '图片发送失败', 'error')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '图片发送失败', 'error')
+    } finally {
+      setImageBusy(false)
+    }
+  }, [selectedImage])
 
   const reloadRegionsForApp = useCallback(async (type: AppType) => {
     const r = (await window.electron?.invoke('capture:getRegions', type)) as BoxRegions | null
@@ -307,9 +394,7 @@ function ControlPanel({
   // 初次加载：读出当前 appType + 对应的框选区域
   useEffect(() => {
     void (async () => {
-      const settings = (await window.electron?.invoke('settings:getAll')) as
-        | AppSettings
-        | undefined
+      const settings = (await window.electron?.invoke('settings:getAll')) as AppSettings | undefined
       const initial = settings?.appType || 'wechat'
       setAppType(initial)
       await reloadRegionsForApp(initial)
@@ -411,6 +496,44 @@ function ControlPanel({
         onOpenWizard={handleOpenWizard}
       />
 
+      <section className="image-workflow" aria-label="图片处理">
+        <div className="image-workflow-title">图片处理</div>
+        <button className="btn btn-secondary" onClick={pickImage} disabled={imageBusy}>
+          选择图片
+        </button>
+        {selectedImage ? (
+          <>
+            <img
+              className="image-workflow-preview"
+              src={selectedImage.preview}
+              alt="待处理图片预览"
+            />
+            <textarea
+              className="form-input"
+              value={imagePrompt}
+              onChange={(event) => setImagePrompt(event.target.value)}
+              maxLength={2000}
+              aria-label="图片识别提示词"
+            />
+            <div className="image-workflow-actions">
+              <button className="btn btn-secondary" onClick={analyzeImage} disabled={imageBusy}>
+                {imageBusy ? '处理中…' : '识别图片'}
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={sendSelectedImage}
+                disabled={
+                  imageBusy || status === 'running' || !['wechat', 'wework'].includes(appType)
+                }
+              >
+                发送到当前会话
+              </button>
+            </div>
+            {imageResult ? <div className="image-workflow-result">{imageResult}</div> : null}
+          </>
+        ) : null}
+      </section>
+
       <div className="card">
         <div className="card-title">{t('control.log')}</div>
         <div className="message-log" ref={logRef}>
@@ -455,11 +578,7 @@ function TargetAppQuickCard({
   onAppTypeChange,
   onOpenWizard
 }: TargetAppQuickCardProps): React.JSX.Element {
-  const statusText = isVlm
-    ? '自动识别（VLM）'
-    : regions
-      ? '已框选 3 / 3 个区域'
-      : '尚未框选'
+  const statusText = isVlm ? '自动识别（VLM）' : regions ? '已框选 3 / 3 个区域' : '尚未框选'
 
   return (
     <div className="card" style={{ marginBottom: 12 }}>
@@ -550,6 +669,22 @@ function TargetAppQuickCard({
   )
 }
 
+function requiresVisionKey(
+  settings: AppSettings,
+  providerInfo: { installed?: InstalledProviderInfo | null; isBuiltinDefault?: boolean }
+): boolean {
+  const appType = settings.appType || 'wechat'
+  const perAppStrategy = settings.capture?.[appType]?.strategy || 'auto'
+  const defaultStrategy = settings.defaultCaptureStrategy || 'auto'
+  const effectiveStrategy = perAppStrategy === 'auto' ? defaultStrategy : perAppStrategy
+  const usesVlm =
+    effectiveStrategy === 'vlm' ||
+    (effectiveStrategy === 'auto' && (appType === 'wechat' || appType === 'wework'))
+  const usesBuiltinDoubao =
+    providerInfo.isBuiltinDefault === true || providerInfo.installed?.id === 'volcengine-ark'
+  return (usesVlm && providerInfo.installed?.id !== SILICONFLOW_PROVIDER_ID) || usesBuiltinDoubao
+}
+
 function BottomBar({
   status,
   setStatus
@@ -558,34 +693,47 @@ function BottomBar({
   setStatus: (s: EngineStatus) => void
 }) {
   const handleStart = useCallback(async () => {
-    const settings = (await window.electron?.invoke('settings:getAll')) as AppSettings | undefined
-    if (!settings?.vision?.apiKey) {
-      showToast(t('control.start.novisionkey'), 'error')
-      return
-    }
-    // 没装自定义 provider → 走内置 doubao（getInstalled 会返回 isBuiltinDefault: true）
-    const providerInfo = (await window.electron?.invoke('provider:getInstalled')) as {
-      manifest: ProviderManifest | null
-      isBuiltinDefault?: boolean
-    }
-    // doubao 默认共享视觉密钥，required 已剥离 apiKey
-    const required = providerInfo?.manifest?.configSchema?.required || []
-    const missing = required.find((key) => {
-      const value = settings.chatProvider.config?.[key]
-      return value === undefined || value === null || value === ''
-    })
-    if (missing) {
-      showToast(`${t('control.start.missingProviderField')}: ${missing}`, 'error')
-      return
-    }
+    try {
+      const settings = (await window.electron?.invoke('settings:getAll')) as AppSettings | undefined
+      if (!settings) {
+        showToast(t('toast.startFailed'), 'error')
+        return
+      }
 
-    const result = await window.electron?.invoke('engine:start', settings)
-    if (result?.success) {
-      setStatus('running')
-      showToast(t('toast.engineStarted'), 'success')
-    } else {
+      // A custom Provider can run in manual box-select mode without the VLM key.
+      const providerInfo = (await window.electron?.invoke('provider:getInstalled')) as {
+        installed?: InstalledProviderInfo | null
+        manifest: ProviderManifest | null
+        isBuiltinDefault?: boolean
+      }
+      if (requiresVisionKey(settings, providerInfo) && !settings.vision?.apiKey?.trim()) {
+        showToast(t('control.start.novisionkey'), 'error')
+        return
+      }
+
+      const required = (providerInfo?.manifest?.configSchema?.required || []).filter(
+        (key) => !(providerInfo?.installed?.id === 'volcengine-ark' && key === 'apiKey')
+      )
+      const missing = required.find((key) => {
+        const value = settings.chatProvider.config?.[key]
+        return value === undefined || value === null || value === ''
+      })
+      if (missing) {
+        showToast(`${t('control.start.missingProviderField')}: ${missing}`, 'error')
+        return
+      }
+
+      const result = await window.electron?.invoke('engine:start', settings)
+      if (result?.success) {
+        setStatus('running')
+        showToast(t('toast.engineStarted'), 'success')
+      } else {
+        setStatus('error')
+        showToast(result?.error || t('toast.startFailed'), 'error')
+      }
+    } catch (error: unknown) {
       setStatus('error')
-      showToast(result?.error || t('toast.startFailed'), 'error')
+      showToast(error instanceof Error ? error.message : t('toast.startFailed'), 'error')
     }
   }, [setStatus])
 
@@ -661,6 +809,7 @@ function SettingsWindow(): React.JSX.Element {
 
 function SettingsPanel() {
   const [visionApiKey, setVisionApiKey] = useState('')
+  const [visionModel, setVisionModel] = useState(ARK_MODEL)
   const [testing, setTesting] = useState(false)
 
   useEffect(() => {
@@ -668,6 +817,7 @@ function SettingsPanel() {
       const settings = (await window.electron?.invoke('settings:getAll')) as AppSettings | undefined
       if (settings) {
         setVisionApiKey(settings.vision?.apiKey || '')
+        setVisionModel(settings.vision?.model || ARK_MODEL)
       }
     }
 
@@ -675,24 +825,28 @@ function SettingsPanel() {
   }, [])
 
   const handleSaveVision = useCallback(async () => {
+    if (!visionModel.trim()) {
+      showToast(t('settings.visionModel.required'), 'error')
+      return
+    }
     const payload: Partial<AppSettings> = {
-      vision: { apiKey: visionApiKey }
+      vision: { apiKey: visionApiKey.trim(), model: visionModel.trim() }
     }
     await window.electron?.invoke('settings:set', payload)
-    await window.electron?.invoke('engine:updateConfig', {
-      ...((await window.electron?.invoke('settings:getAll')) as AppSettings),
-      ...payload,
-      vision: { apiKey: visionApiKey }
-    })
+    await window.electron?.invoke(
+      'engine:updateConfig',
+      (await window.electron?.invoke('settings:getAll')) as AppSettings
+    )
     showToast(t('settings.saved'), 'success')
-  }, [visionApiKey])
+  }, [visionApiKey, visionModel])
 
   const handleTestConnection = useCallback(async () => {
-    if (!visionApiKey) return
+    if (!visionApiKey.trim() || !visionModel.trim()) return
     setTesting(true)
     try {
       const result = await window.electron?.invoke('engine:testConnection', {
-        apiKey: visionApiKey
+        apiKey: visionApiKey.trim(),
+        model: visionModel.trim()
       })
       if (result?.success) {
         showToast(t('settings.testConnection.success'), 'success')
@@ -704,7 +858,7 @@ function SettingsPanel() {
     } finally {
       setTesting(false)
     }
-  }, [visionApiKey])
+  }, [visionApiKey, visionModel])
 
   return (
     <div className="settings-page slide-up">
@@ -733,19 +887,26 @@ function SettingsPanel() {
 
         <div className="form-group">
           <label className="form-label">{t('settings.visionModel')}</label>
-          <input className="form-input" value="doubao-seed-2-0-lite-260215" disabled />
+          <input
+            className="form-input"
+            value={visionModel}
+            onChange={(e) => setVisionModel(e.target.value)}
+            placeholder={t('settings.visionModel.placeholder')}
+            autoComplete="off"
+          />
+          <div className="form-hint">{t('settings.visionModel.hint')}</div>
         </div>
 
         <div className="form-group">
           <label className="form-label">{t('settings.visionBaseUrl')}</label>
-          <input className="form-input" value="https://ark.cn-beijing.volces.com/api/v3" disabled />
+          <input className="form-input" value={ARK_BASE_URL} disabled />
         </div>
 
         <div style={{ display: 'flex', gap: 8 }}>
           <button
             className="btn btn-secondary"
             onClick={handleTestConnection}
-            disabled={!visionApiKey || testing}
+            disabled={!visionApiKey.trim() || !visionModel.trim() || testing}
           >
             {testing ? t('settings.testConnection.testing') : t('settings.testConnection')}
           </button>
@@ -762,47 +923,112 @@ function AgentPanel(): React.JSX.Element {
   const [catalog, setCatalog] = useState<ProviderCatalogItem[]>(BUILTIN_PROVIDER_CATALOG)
   const [selectedId, setSelectedId] = useState(BUILTIN_PROVIDER_CATALOG[0]?.id || '')
   const [activeId, setActiveId] = useState('doubao')
-  const [providerDrafts, setProviderDrafts] = useState<Record<string, Record<string, string>>>({})
+  const [providerDrafts, setProviderDrafts] = useState<
+    Record<string, Record<string, string | boolean>>
+  >({})
   const [currentSettings, setCurrentSettings] = useState<AppSettings | null>(null)
   const [loadingCatalog, setLoadingCatalog] = useState(false)
   const [updatingCatalog, setUpdatingCatalog] = useState(false)
+  const [manifestUrl, setManifestUrl] = useState('')
+  const [installing, setInstalling] = useState(false)
+  const [siliconFlow, setSiliconFlow] = useState<{
+    configured: boolean
+    environmentConfigured: boolean
+    model: string
+  } | null>(null)
+  const [catalogError, setCatalogError] = useState('')
   const selectedProvider = catalog.find((provider) => provider.id === selectedId) || catalog[0]
 
   const loadSettingsAndCatalog = useCallback(async (forceUpdate: boolean) => {
     setLoadingCatalog(!forceUpdate)
     setUpdatingCatalog(forceUpdate)
     try {
-      const [settings, result] = await Promise.all([
+      const [settings, result, installedProvider, siliconStatus] = await Promise.all([
         window.electron?.invoke('settings:getAll') as Promise<AppSettings | undefined>,
-        window.electron?.invoke(forceUpdate ? 'providerHub:update' : 'providerHub:getCatalog') as Promise<ProviderHubResult>
+        window.electron?.invoke(
+          forceUpdate ? 'providerHub:update' : 'providerHub:getCatalog'
+        ) as Promise<ProviderHubResult>,
+        window.electron?.invoke('provider:getInstalled') as Promise<{
+          installed: InstalledProviderInfo | null
+          manifest: ProviderManifest | null
+          isBuiltinDefault?: boolean
+        }>,
+        window.electron?.invoke('siliconflow:status') as Promise<{
+          configured: boolean
+          environmentConfigured: boolean
+          model: string
+        }>
       ])
+      setSiliconFlow(siliconStatus || null)
 
-      const nextCatalog = mergeProviderCatalog(result?.catalog?.providers || [])
+      const remoteProviders = result?.catalog?.providers || []
+      setCatalogError(result?.success ? '' : '远端智能体目录暂不可用；本地内置豆包仍可使用。')
+      if (installedProvider?.manifest && !installedProvider.isBuiltinDefault) {
+        const manifest = installedProvider.manifest
+        const item: ProviderCatalogItem = {
+          id: manifest.id,
+          name: manifest.name,
+          version: manifest.version,
+          manifestUrl: settings?.chatProvider.manifestUrl || '',
+          configSchema: {
+            fields: Object.entries(manifest.configSchema.properties).map(([key, field]) => ({
+              key,
+              label: field.title,
+              type: field.type === 'string' ? 'text' : field.type,
+              required: manifest.configSchema.required?.includes(key),
+              defaultValue: field.default,
+              options: field.enum?.map((value) => ({ label: value, value }))
+            }))
+          }
+        }
+        const index = remoteProviders.findIndex((provider) => provider.id === item.id)
+        if (index < 0) remoteProviders.push(item)
+        else remoteProviders[index] = item
+      }
+      const nextCatalog = mergeProviderCatalog(remoteProviders)
       const nextActiveId = settings?.chatProvider?.installed?.id || 'doubao'
       setCatalog(nextCatalog)
       setCurrentSettings(settings || null)
       setActiveId(nextActiveId)
-      setSelectedId((current) => current || nextActiveId || BUILTIN_PROVIDER_CATALOG[0]?.id || nextCatalog[0]?.id || '')
+      setSelectedId(
+        (current) =>
+          current || nextActiveId || BUILTIN_PROVIDER_CATALOG[0]?.id || nextCatalog[0]?.id || ''
+      )
       setProviderDrafts((prev) => ({
         ...prev,
         doubao: {
           ...getProviderDefaults(BUILTIN_PROVIDER_CATALOG[0]),
           ...(prev.doubao || {}),
           ...(!settings?.chatProvider?.installed ? settings?.chatProvider?.config || {} : {}),
-          apiKey: prev.doubao?.apiKey || settings?.vision?.apiKey || ''
+          apiKey: prev.doubao?.apiKey ?? settings?.vision?.apiKey ?? '',
+          model: prev.doubao?.model ?? settings?.vision?.model ?? ARK_MODEL
         },
-        [nextActiveId]: {
-          ...getProviderDefaults(nextCatalog.find((provider) => provider.id === nextActiveId)),
-          ...(prev[nextActiveId] || {}),
-          ...(settings?.chatProvider?.config || {})
-        }
+        [SILICONFLOW_PROVIDER_ID]: {
+          ...getProviderDefaults(BUILTIN_PROVIDER_CATALOG[1]),
+          apiKey: settings?.siliconFlow?.apiKey ?? '',
+          model: settings?.siliconFlow?.model || siliconStatus?.model || SILICONFLOW_DEFAULT_MODEL,
+          ...(prev[SILICONFLOW_PROVIDER_ID] || {})
+        },
+        ...(nextActiveId !== 'doubao' && nextActiveId !== SILICONFLOW_PROVIDER_ID
+          ? {
+              [nextActiveId]: {
+                ...getProviderDefaults(
+                  nextCatalog.find((provider) => provider.id === nextActiveId)
+                ),
+                ...(settings?.chatProvider?.config || {}),
+                ...(prev[nextActiveId] || {})
+              }
+            }
+          : {})
       }))
 
-      if (result && !result.success) {
+      if (forceUpdate && result && !result.success) {
         showToast(`智能体列表加载失败: ${result.error || ''}`, 'error')
       } else if (forceUpdate) {
         showToast('智能体列表已更新', 'success')
       }
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '智能体列表加载失败', 'error')
     } finally {
       setLoadingCatalog(false)
       setUpdatingCatalog(false)
@@ -813,13 +1039,34 @@ function AgentPanel(): React.JSX.Element {
     void loadSettingsAndCatalog(false)
   }, [loadSettingsAndCatalog])
 
+  const handleInstall = useCallback(async () => {
+    if (!manifestUrl.trim() || installing) return
+    setInstalling(true)
+    try {
+      const result = await window.electron?.invoke('provider:installFromUrl', manifestUrl.trim())
+      if (!result?.success) throw new Error(result?.error || '智能体安装失败')
+      setProviderDrafts((previous) => {
+        const next = { ...previous }
+        delete next[result.installed.id]
+        return next
+      })
+      setSelectedId(result.installed.id)
+      await loadSettingsAndCatalog(false)
+      showToast('智能体已安装，请填写其必填配置后启动', 'success')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '智能体安装失败', 'error')
+    } finally {
+      setInstalling(false)
+    }
+  }, [manifestUrl, installing, loadSettingsAndCatalog])
+
   const selectedValues = useMemo(
     () => getProviderValues(providerDrafts, selectedProvider, currentSettings),
     [currentSettings, providerDrafts, selectedProvider]
   )
 
   const setProviderValue = useCallback(
-    (fieldKey: string, value: string) => {
+    (fieldKey: string, value: string | boolean) => {
       if (!selectedProvider) return
       setProviderDrafts((prev) => ({
         ...prev,
@@ -833,7 +1080,7 @@ function AgentPanel(): React.JSX.Element {
   )
 
   const persistProvider = useCallback(
-    async (provider: ProviderCatalogItem, values: Record<string, string>) => {
+    async (provider: ProviderCatalogItem, values: Record<string, string | boolean>) => {
       const missing = getMissingRequiredFields(provider, values)
       if (missing.length > 0) {
         showToast(`缺少必填项: ${missing.join('、')}`, 'error')
@@ -841,9 +1088,9 @@ function AgentPanel(): React.JSX.Element {
       }
 
       if (provider.id === 'doubao') {
-        const { apiKey, ...providerConfig } = values
+        const { apiKey, model, ...providerConfig } = values
         await window.electron?.invoke('settings:set', {
-          vision: { apiKey },
+          vision: { apiKey: String(apiKey || '').trim(), model: String(model || '').trim() },
           chatProvider: {
             manifestUrl: '',
             installed: null,
@@ -857,7 +1104,40 @@ function AgentPanel(): React.JSX.Element {
         return true
       }
 
-      const installResult = await window.electron?.invoke('provider:installFromUrl', provider.manifestUrl)
+      if (provider.id === SILICONFLOW_PROVIDER_ID) {
+        const state = await window.electron?.invoke('siliconflow:status')
+        const apiKey = String(values.apiKey || '').trim()
+        if (!apiKey && !state?.environmentConfigured) {
+          showToast('请填写硅基流动 API Key，或设置 SILICONFLOW_API_KEY', 'error')
+          return false
+        }
+        await window.electron?.invoke('settings:set', {
+          siliconFlow: { apiKey, model: String(values.model || '').trim() },
+          chatProvider: {
+            manifestUrl: 'builtin://siliconflow',
+            installed: {
+              id: SILICONFLOW_PROVIDER_ID,
+              name: provider.name,
+              version: provider.version,
+              entryFile: 'builtin://siliconflow',
+              installedAt: '0'
+            },
+            config: {}
+          }
+        })
+        const settings = (await window.electron?.invoke('settings:getAll')) as AppSettings
+        await window.electron?.invoke('engine:updateConfig', settings)
+        setSiliconFlow(await window.electron?.invoke('siliconflow:status'))
+        setCurrentSettings(settings)
+        setActiveId(provider.id)
+        return true
+      }
+
+      const installResult =
+        currentSettings?.chatProvider.installed?.id === provider.id &&
+        currentSettings.chatProvider.manifestUrl === provider.manifestUrl
+          ? { success: true, installed: currentSettings.chatProvider.installed }
+          : await window.electron?.invoke('provider:installFromUrl', provider.manifestUrl)
       if (!installResult?.success) {
         showToast(installResult?.error || '智能体安装失败', 'error')
         return false
@@ -876,19 +1156,27 @@ function AgentPanel(): React.JSX.Element {
       setActiveId(provider.id)
       return true
     },
-    []
+    [currentSettings]
   )
 
   const handleSaveConfig = useCallback(async () => {
     if (!selectedProvider) return
-    const ok = await persistProvider(selectedProvider, selectedValues)
-    if (ok) showToast('智能体配置已保存', 'success')
+    try {
+      const ok = await persistProvider(selectedProvider, selectedValues)
+      if (ok) showToast('智能体配置已保存', 'success')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '配置保存失败', 'error')
+    }
   }, [persistProvider, selectedProvider, selectedValues])
 
   const handleActivate = useCallback(async () => {
     if (!selectedProvider) return
-    const ok = await persistProvider(selectedProvider, selectedValues)
-    if (ok) showToast('已切换当前智能体', 'success')
+    try {
+      const ok = await persistProvider(selectedProvider, selectedValues)
+      if (ok) showToast('已切换当前智能体', 'success')
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '配置保存失败', 'error')
+    }
   }, [persistProvider, selectedProvider, selectedValues])
 
   return (
@@ -914,10 +1202,41 @@ function AgentPanel(): React.JSX.Element {
         </div>
       </div>
 
+      <div className="card">
+        <label className="form-label" htmlFor="provider-manifest-url">
+          聊天服务配置清单地址
+        </label>
+        <div className="provider-install-row">
+          <input
+            id="provider-manifest-url"
+            className="form-input"
+            value={manifestUrl}
+            onChange={(event) => setManifestUrl(event.target.value)}
+            placeholder="https://example.com/provider/manifest.json"
+            autoComplete="off"
+          />
+          <button
+            className="btn btn-secondary"
+            onClick={handleInstall}
+            disabled={installing || !manifestUrl.trim()}
+          >
+            {installing ? '安装中…' : '安装'}
+          </button>
+        </div>
+        <div className="form-hint">
+          支持 HTTPS 和本地 file:/// 路径。仅安装可信 Provider；密钥请填在下方配置中。
+        </div>
+      </div>
+
       {loadingCatalog ? (
         <div className="provider-hub-meta">
           <span className="spinner" />
           正在加载远端智能体列表
+        </div>
+      ) : null}
+      {!loadingCatalog && catalogError ? (
+        <div className="provider-hub-meta" role="status">
+          {catalogError}
         </div>
       ) : null}
 
@@ -969,10 +1288,18 @@ function AgentPanel(): React.JSX.Element {
                 <ProviderFieldInput
                   key={field.key}
                   field={field}
-                  value={selectedValues[field.key] || ''}
+                  value={selectedValues[field.key] ?? ''}
                   onChange={(value) => setProviderValue(field.key, value)}
                 />
               ))}
+
+              {selectedProvider.id === SILICONFLOW_PROVIDER_ID ? (
+                <div className="form-hint" role="status">
+                  {siliconFlow?.configured
+                    ? `已配置；当前视觉模型：${siliconFlow.model}`
+                    : '请填写硅基流动 API Key，或设置 SILICONFLOW_API_KEY'}
+                </div>
+              ) : null}
 
               <div className="provider-actions">
                 <button className="btn btn-secondary" onClick={handleSaveConfig}>
@@ -998,8 +1325,8 @@ function ProviderFieldInput({
   onChange
 }: {
   field: ProviderConfigField
-  value: string
-  onChange: (value: string) => void
+  value: string | boolean
+  onChange: (value: string | boolean) => void
 }): React.JSX.Element {
   return (
     <div className="form-group">
@@ -1007,10 +1334,17 @@ function ProviderFieldInput({
         {field.label}
         {field.required ? <span className="required-mark"> *</span> : null}
       </label>
-      {field.type === 'textarea' ? (
+      {field.type === 'boolean' ? (
+        <input
+          type="checkbox"
+          checked={value === true}
+          disabled={field.readonly}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+      ) : field.type === 'textarea' ? (
         <textarea
           className="form-input"
-          value={value}
+          value={String(value)}
           onChange={(event) => onChange(event.target.value)}
           placeholder={field.placeholder}
           rows={4}
@@ -1019,7 +1353,7 @@ function ProviderFieldInput({
       ) : field.type === 'select' ? (
         <select
           className="form-input"
-          value={value}
+          value={String(value)}
           onChange={(event) => onChange(event.target.value)}
           disabled={field.readonly}
         >
@@ -1033,7 +1367,7 @@ function ProviderFieldInput({
         <input
           className="form-input"
           type={field.type === 'password' ? 'password' : field.type === 'url' ? 'url' : 'text'}
-          value={value}
+          value={String(value)}
           onChange={(event) => onChange(event.target.value)}
           placeholder={field.placeholder}
           autoComplete="off"
@@ -1052,27 +1386,38 @@ function mergeProviderCatalog(remoteProviders: ProviderCatalogItem[]): ProviderC
   return [...BUILTIN_PROVIDER_CATALOG, ...remoteOnly]
 }
 
-function getProviderDefaults(provider: ProviderCatalogItem | undefined): Record<string, string> {
+function getProviderDefaults(
+  provider: ProviderCatalogItem | undefined
+): Record<string, string | boolean> {
   if (!provider) return {}
-  return provider.configSchema.fields.reduce<Record<string, string>>((acc, field) => {
-    acc[field.key] = field.defaultValue || ''
+  return provider.configSchema.fields.reduce<Record<string, string | boolean>>((acc, field) => {
+    acc[field.key] = field.defaultValue ?? (field.type === 'boolean' ? false : '')
     return acc
   }, {})
 }
 
 function getProviderValues(
-  drafts: Record<string, Record<string, string>>,
+  drafts: Record<string, Record<string, string | boolean>>,
   provider: ProviderCatalogItem | undefined,
   settings: AppSettings | null
-): Record<string, string> {
+): Record<string, string | boolean> {
   if (!provider) return {}
   const defaults = getProviderDefaults(provider)
   if (provider.id === 'doubao') {
     return {
       ...defaults,
       ...(settings?.chatProvider.installed ? {} : settings?.chatProvider.config || {}),
-      apiKey: drafts.doubao?.apiKey || settings?.vision.apiKey || '',
+      apiKey: drafts.doubao?.apiKey ?? settings?.vision.apiKey ?? '',
+      model: drafts.doubao?.model ?? settings?.vision.model ?? ARK_MODEL,
       ...(drafts.doubao || {})
+    }
+  }
+  if (provider.id === SILICONFLOW_PROVIDER_ID) {
+    return {
+      ...defaults,
+      apiKey: settings?.siliconFlow?.apiKey ?? '',
+      model: settings?.siliconFlow?.model || defaults.model,
+      ...(drafts[provider.id] || {})
     }
   }
   return {
@@ -1084,31 +1429,39 @@ function getProviderValues(
 
 function getMissingRequiredFields(
   provider: ProviderCatalogItem,
-  values: Record<string, string>
+  values: Record<string, string | boolean>
 ): string[] {
   return provider.configSchema.fields
-    .filter((field) => field.required && !values[field.key]?.trim())
+    .filter((field) => {
+      if (!field.required) return false
+      const value = values[field.key]
+      return value === undefined || (typeof value === 'string' && value.trim() === '')
+    })
     .map((field) => field.label)
 }
 
-let _showToast: ((msg: string, type: 'success' | 'error') => void) | null = null
-
-export function showToast(msg: string, type: 'success' | 'error') {
-  _showToast?.(msg, type)
-}
-
-function Toast() {
+function Toast(): React.JSX.Element {
   const [visible, setVisible] = useState(false)
   const [message, setMessage] = useState('')
   const [type, setType] = useState<'success' | 'error'>('success')
   const timerRef = useRef<number | undefined>(undefined)
 
-  _showToast = useCallback((msg: string, t: 'success' | 'error') => {
-    setMessage(msg)
-    setType(t)
-    setVisible(true)
-    if (timerRef.current) clearTimeout(timerRef.current)
-    timerRef.current = window.setTimeout(() => setVisible(false), 2500)
+  useEffect(() => {
+    const handleToast = (event: Event): void => {
+      const detail = (event as CustomEvent<ToastDetail>).detail
+      if (!detail?.message) return
+      setMessage(detail.message)
+      setType(detail.type)
+      setVisible(true)
+      if (timerRef.current) clearTimeout(timerRef.current)
+      timerRef.current = window.setTimeout(() => setVisible(false), 2500)
+    }
+
+    window.addEventListener(TOAST_EVENT, handleToast)
+    return () => {
+      window.removeEventListener(TOAST_EVENT, handleToast)
+      if (timerRef.current) clearTimeout(timerRef.current)
+    }
   }, [])
 
   return <div className={`toast ${type} ${visible ? 'show' : ''}`}>{message}</div>

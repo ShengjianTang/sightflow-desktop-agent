@@ -20,9 +20,9 @@ if (process.contextIsolated) {
     console.error(error)
   }
 } else {
-  // @ts-ignore
+  // @ts-ignore -- context isolation is disabled only in the legacy fallback path.
   window.electron = electronHandler
-  // @ts-ignore
+  // @ts-ignore -- context isolation is disabled only in the legacy fallback path.
   window.osInfo = { platform: process.platform }
 }
 

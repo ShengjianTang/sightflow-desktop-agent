@@ -108,6 +108,11 @@ interface ProviderInput {
   appType: AppType
   currentContact?: string
   ocrText?: string
+  captureContext?: 'full_window' | 'chat_area'
+  observation?: { conversationId: string; historyId: string; chatAreaBbox?: BBox }
+  recentSentMessages?: string[]
+  conversationHistory?: ConversationMessage[]
+  pendingIncomingMessages?: ConversationMessage[]
   // 运行时注入的经验卡片（工作记忆），Provider 可拼入 system prompt
   memoryCards?: MemoryCardBrief[]
 }
@@ -120,9 +125,23 @@ interface ProviderInput {
 Provider 可以返回的事件：
 
 ```ts
+type BBox = [number, number, number, number] // screenshot coordinates, 0–1000
+interface ConversationMessage {
+  sender: 'incoming' | 'self'
+  kind: 'text' | 'image' | 'emoji'
+  text: string
+}
+
 type ProviderEvent =
   | { type: 'thinking'; content: string }
-  | { type: 'reply_text'; content: string }
+  | {
+      type: 'reply_text'
+      content: string
+      latestMessage?: string
+      sender?: 'incoming' | 'self' | 'unknown'
+      senderBbox?: BBox
+      messages?: (ConversationMessage & { senderBbox: BBox })[]
+    }
   | { type: 'skip' }
   | { type: 'error'; error: string }
 ```
@@ -131,6 +150,10 @@ type ProviderEvent =
 - `reply_text`：应用会把这段文本发送到当前聊天窗口。
 - `skip`：本轮不回复，例如最后一条消息是自己发的、系统消息、无法判断等。
 - `error`：本轮失败，错误会展示到运行日志。
+
+`messages` 必须按截图从上到下的顺序包含发送方可确认的完整可见普通消息，包括自身气泡；顶部被裁切的历史消息可以省略，底部最新消息不得省略。每条记录提供自己的头像位置，不能把多条消息合成一个位置，也不能丢掉格式错误的自身消息。`latestMessage`、`sender`、`senderBbox` 必须对应列表最后一条。内置 Provider 从第一轮就要求这些证据；旧自定义 Provider 的纯文字输出仅保留首次回复兼容，本会话回复后缺少消息列表会被拦截。
+
+`conversationHistory` 是已完成的会话上下文，`pendingIncomingMessages` 是上一次因画面变化取消发送后仍待回答的内容，均按会话隔离。结合截图中最新未回复批次生成一次连贯回复，不要仅回答最后一句；历史中已回答的内容不是新消息。宿主在通过消息边界检查后才调用发送，并只接受每轮一次终态结果。API Key 继续由用户在设置页或支持的环境变量中填写，不要放进消息或日志。
 
 ## 在应用中安装 Provider
 
@@ -161,11 +184,11 @@ resources/providers/volcengine-ark/provider.bundle.js
 3. Provider 收到 `input.screenshot` 后，调用火山方舟 OpenAI 兼容接口：
 
 ```text
-POST https://ark.cn-beijing.volces.com/api/v3/chat/completions
+POST https://ark.cn-beijing.volces.com/api/v3/responses
 ```
 
-4. 请求中使用 `messages`，把截图作为 `image_url`，把回复要求作为文本消息传入。
-5. 如果模型返回空内容或 `[SKIP]`，Provider 返回 `skip`；否则返回 `reply_text`，由桌面端继续完成发送。
+4. 请求中使用 `input`，截图项为 `input_image`，文本项为 `input_text`，同时传入会话上下文和待回复批次。
+5. 解析结构化判断；不确定或证据不足时复核一次，仍无法确认则 `skip`。通过检查的 `reply_text` 携带消息列表和发送方证据，由桌面端核对边界后发送。
 
 本地开发时，可以在设置页填写类似下面的地址安装内置示例：
 

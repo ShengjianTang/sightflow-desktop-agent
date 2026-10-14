@@ -13,6 +13,9 @@
 // humanLikeMove、screen.getDisplayMatching 一致；裁剪到物理像素的换算由 captureScreenRegion 内部处理。
 
 import { DesktopDevice } from './device'
+import { captureStableChat, outgoingBubbleBottom } from './chat-observation'
+import { createHash } from 'node:crypto'
+import type { ChatObservation } from './session-types'
 import { AppType, BoxRegions, ScreenRect } from './rpa/types'
 import {
   BBox,
@@ -21,7 +24,7 @@ import {
   LayoutCache,
   setLayoutCache
 } from './rpa/vision-utils'
-import { captureChatMainArea } from './rpa/screenshot-utils'
+import { captureChatMainArea, clearScreenshotCache } from './rpa/screenshot-utils'
 import {
   activeUnreadByClickAction,
   clickUnreadContactAction,
@@ -29,6 +32,7 @@ import {
   sendReplyByCoordsAction
 } from './rpa/input-utils'
 import { comparePngBuffers } from './rpa/image-compare'
+import { DesktopStateError } from './desktop-errors'
 
 function rectCenter(rect: ScreenRect): [number, number] {
   return [rect.x + rect.width / 2, rect.y + rect.height / 2]
@@ -38,6 +42,7 @@ export class BoxSelectDevice implements DesktopDevice {
   private appType: AppType = 'generic'
   private regions: BoxRegions | null
   private chatBaseline: Buffer | null = null
+  private observedHistory: Buffer | null = null
 
   constructor(regions: BoxRegions | null = null) {
     this.regions = regions
@@ -64,6 +69,7 @@ export class BoxSelectDevice implements DesktopDevice {
   onSessionStop(): void {
     clearLayoutCache(this.appType)
     this.chatBaseline = null
+    this.observedHistory = null
   }
 
   // ── 感知层 ──
@@ -111,12 +117,42 @@ export class BoxSelectDevice implements DesktopDevice {
 
   // 把 chatMain 区域截图作为"会话上下文"返回给 provider VLM 分析。
   // 比起 RPADevice 整窗截图，这里更聚焦于聊天内容，省 token 且与目标 app 无关。
+  captureStableScreenshot(isRunning: () => boolean): Promise<string> {
+    return captureStableChat(this, isRunning)
+  }
+
   async screenshot(): Promise<string> {
+    clearScreenshotCache()
     const image = await captureChatMainArea(this.appType)
     if (!image) {
       throw new Error('chatMain 截图失败')
     }
+    this.observedHistory = image.toPNG()
     return image.toDataURL()
+  }
+
+  getCaptureContext(): 'chat_area' {
+    return 'chat_area'
+  }
+
+  getObservationContext(): ChatObservation | undefined {
+    return this.observedHistory
+      ? {
+          conversationId: `box-select:${this.appType}`,
+          historyId: createHash('sha256').update(this.observedHistory).digest('hex'),
+          outgoingBubbleBottom:
+            this.appType === 'wechat'
+              ? outgoingBubbleBottom(this.observedHistory.toString('base64'), [0, 0, 1000, 1000])
+              : undefined,
+          chatAreaBbox: [0, 0, 1000, 1000]
+        }
+      : undefined
+  }
+
+  commitObservationBaseline(): boolean {
+    if (!this.observedHistory) return false
+    this.chatBaseline = this.observedHistory
+    return true
   }
 
   // 单会话模式：BoxSelectDevice 只关心"当前已经打开的对话窗口里有没有新内容"，
@@ -176,11 +212,20 @@ export class BoxSelectDevice implements DesktopDevice {
 
   clearChatBaseline(): void {
     this.chatBaseline = null
+    this.observedHistory = null
   }
 
   // ── 动作层 ──
 
   async sendMessage(text: string): Promise<void> {
+    clearScreenshotCache()
+    const current = await captureChatMainArea(this.appType)
+    if (!current) throw new DesktopStateError('target_unavailable', '发送前无法确认聊天内容')
+    if (this.observedHistory && comparePngBuffers(this.observedHistory, current.toPNG()).hasChanged)
+      throw new DesktopStateError(
+        'conversation_changed',
+        '模型分析期间聊天内容已改变，已取消旧回复并重新识别最新消息'
+      )
     const inputArea = getInputAreaFromCache(this.appType)
     if (!inputArea) throw new Error('尚未测量输入框区域')
     const [x, y] = inputArea.coordinates

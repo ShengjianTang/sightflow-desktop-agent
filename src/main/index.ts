@@ -1,4 +1,6 @@
-import { app, shell, BrowserWindow, ipcMain, desktopCapturer } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, desktopCapturer, dialog, nativeImage } from 'electron'
+import { readFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import icon from '../../resources/icon.png?asset'
@@ -21,7 +23,6 @@ import {
   getBuiltinDoubaoManifestForUi,
   getInstalledProviderManifest,
   installProviderFromUrl,
-  InstalledProviderInfo,
   loadBuiltinDoubaoProvider,
   loadInstalledProvider
 } from './provider-bundle'
@@ -41,34 +42,31 @@ import {
 import { TraceStepInput } from '../core/trace/trace-types'
 import { ExperienceStore, NewExperienceCard } from '../core/memory/experience-store'
 import { induceCardsFromSession } from '../core/memory/learn-from-session'
+import { ARK_BASE_URL, ARK_MODEL } from '../core/ai-config'
+import { fetchWithTimeout } from '../core/http-request'
+import { validateImageDataUrl, SILICONFLOW_PROVIDER_ID } from '../core/siliconflow-client'
+import {
+  SILICONFLOW_INSTALLED,
+  SILICONFLOW_MANIFEST,
+  type SiliconFlowConfig,
+  siliconFlowStatus,
+  createSiliconFlowClient,
+  createSiliconFlowProvider
+} from './siliconflow-provider'
+import { sendImageAction } from '../core/rpa/input-utils'
+import {
+  type AppSettings,
+  coerceAppType,
+  normalizeSettings,
+  mergeSettings,
+  withSchemaDefaults
+} from './settings'
 const StoreClass = typeof Store === 'function' ? Store : ((Store as any).default as typeof Store)
 
-const FIXED_ARK_MODEL = 'doubao-seed-2-0-lite-260215'
-const FIXED_ARK_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3'
+const FIXED_ARK_MODEL = ARK_MODEL
+const FIXED_ARK_BASE_URL = ARK_BASE_URL
 
-interface PerAppCapture {
-  strategy: CaptureStrategy
-  regions: BoxRegions | null
-}
-
-interface AppSettings {
-  locale: 'zh' | 'en'
-  appType: AppType
-  vision: {
-    apiKey: string
-  }
-  chatProvider: {
-    manifestUrl: string
-    installed: InstalledProviderInfo | null
-    config: Record<string, any>
-  }
-  // 默认抓取策略（仅当 appType 没有 per-app 覆盖时生效）
-  defaultCaptureStrategy: CaptureStrategy
-  // 每个 appType 独立保存的策略 + 框选区域
-  capture: Partial<Record<AppType, PerAppCapture>>
-}
-
-type ProviderConfigFieldType = 'text' | 'password' | 'url' | 'select' | 'textarea'
+type ProviderConfigFieldType = 'text' | 'password' | 'url' | 'select' | 'textarea' | 'boolean'
 
 type ProviderConfigField = {
   key: string
@@ -78,7 +76,7 @@ type ProviderConfigField = {
   readonly?: boolean
   placeholder?: string
   hint?: string
-  defaultValue?: string
+  defaultValue?: string | boolean
   options?: Array<{ label: string; value: string }>
 }
 
@@ -124,7 +122,8 @@ const settingsStore = new StoreClass({
   defaults: {
     locale: 'zh',
     appType: 'wechat',
-    vision: { apiKey: '' },
+    vision: { apiKey: '', model: ARK_MODEL },
+    siliconFlow: { apiKey: '', model: '' },
     chatProvider: {
       manifestUrl: '',
       installed: null,
@@ -137,8 +136,15 @@ const settingsStore = new StoreClass({
 
 let runtime: RuntimeHost<ReturnType<typeof createInitialGenericChannelState>> | null = null
 let runtimeDevice: DesktopDevice | null = null
+let engineStarting = false
 let settingsWindow: BrowserWindow | null = null
 let memoryWindow: BrowserWindow | null = null
+let selectedImage: { token: string; dataUrl: string } | null = null
+let imageSending = false
+
+function siliconFlowConfig(settings: AppSettings): SiliconFlowConfig {
+  return settings.siliconFlow
+}
 
 // ── 工作记忆（work-trace + 经验卡片）单例，首次使用时初始化 ──
 let traceRecorderInstance: TraceRecorder | null = null
@@ -296,7 +302,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function normalizeFieldType(value: unknown, format?: unknown): ProviderConfigFieldType {
-  if (value === 'password' || value === 'url' || value === 'select' || value === 'textarea') {
+  if (
+    value === 'password' ||
+    value === 'url' ||
+    value === 'select' ||
+    value === 'textarea' ||
+    value === 'boolean'
+  ) {
     return value
   }
   if (format === 'password') return 'password'
@@ -337,7 +349,10 @@ function normalizeManifestConfigFields(configSchema: unknown): ProviderConfigFie
           readonly: field.readonly === true,
           placeholder: typeof field.placeholder === 'string' ? field.placeholder : undefined,
           hint: typeof field.hint === 'string' ? field.hint : undefined,
-          defaultValue: typeof field.defaultValue === 'string' ? field.defaultValue : undefined,
+          defaultValue:
+            typeof field.defaultValue === 'string' || typeof field.defaultValue === 'boolean'
+              ? field.defaultValue
+              : undefined,
           options: normalizeOptions(field.options)
         }
       })
@@ -357,18 +372,17 @@ function normalizeManifestConfigFields(configSchema: unknown): ProviderConfigFie
       readonly: schema.readonly === true || schema.readOnly === true,
       placeholder: typeof schema.placeholder === 'string' ? schema.placeholder : undefined,
       hint: typeof schema.description === 'string' ? schema.description : undefined,
-      defaultValue: typeof schema.default === 'string' ? schema.default : undefined,
+      defaultValue:
+        typeof schema.default === 'string' || typeof schema.default === 'boolean'
+          ? schema.default
+          : undefined,
       options: normalizeOptions(schema.enum)
     }
   })
 }
 
 async function fetchJson(url: string): Promise<unknown> {
-  const response = await fetch(url)
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} ${response.statusText}`)
-  }
-  return response.json()
+  return fetchWithTimeout(url, {}, (response) => response.json(), 10_000, 'Provider Hub 请求超时')
 }
 
 function getCachedProviderHub(): ProviderHubCache | null {
@@ -383,12 +397,13 @@ async function fetchProviderHub(url = DEFAULT_PROVIDER_HUB_URL): Promise<Provide
     throw new Error('Provider hub JSON must contain a providers array')
   }
 
-  const providers = await Promise.all(
+  const results = await Promise.allSettled(
     (hub.providers as ProviderHubEntry[])
       .filter((entry) => entry?.enabled !== false && typeof entry?.manifestUrl === 'string')
       .map(async (entry) => {
         const manifestUrl = entry.manifestUrl as string
         const manifest = (await fetchJson(manifestUrl)) as ProviderHubManifest
+        if (!isRecord(manifest)) throw new Error('Provider manifest 格式无效')
         const id =
           typeof manifest.id === 'string'
             ? manifest.id
@@ -417,6 +432,12 @@ async function fetchProviderHub(url = DEFAULT_PROVIDER_HUB_URL): Promise<Provide
       })
   )
 
+  const providers = results.flatMap((result) =>
+    result.status === 'fulfilled' ? [result.value] : []
+  )
+  if (results.length > 0 && providers.length === 0) {
+    throw new Error('Provider 列表中的配置清单均不可用')
+  }
   const cache = {
     sourceUrl: url,
     fetchedAt: new Date().toISOString(),
@@ -458,34 +479,17 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('settings:set', async (_event, data: Record<string, any>) => {
     const current = normalizeSettings(settingsStore.store)
-    const next = {
-      ...current,
-      ...data,
-      vision: {
-        ...current.vision,
-        ...(data.vision || {})
-      },
-      chatProvider: {
-        ...current.chatProvider,
-        ...(data.chatProvider || {}),
-        config: {
-          ...current.chatProvider.config,
-          ...(data.chatProvider?.config || {})
-        }
-      },
-      capture: {
-        ...current.capture,
-        ...(data.capture || {})
-      }
-    } satisfies AppSettings
-
+    const next = mergeSettings(current, data)
+    if (runtime?.isRunning()) await runtime.stopSession('settings_changed')
     settingsStore.set(next as any)
+    settingsStore.delete('apiKey' as any)
     return { success: true }
   })
 
   ipcMain.handle('provider:installFromUrl', async (_event, manifestUrl: string) => {
     try {
       const result = await installProviderFromUrl(manifestUrl)
+      if (runtime?.isRunning()) await runtime.stopSession('provider_changed')
       const current = normalizeSettings(settingsStore.store)
       settingsStore.set({
         ...current,
@@ -493,7 +497,13 @@ app.whenReady().then(async () => {
           ...current.chatProvider,
           manifestUrl,
           installed: result.installed,
-          config: withSchemaDefaults(result.manifest.configSchema, current.chatProvider.config)
+          config: withSchemaDefaults(
+            result.manifest.configSchema,
+            current.chatProvider.installed?.id === result.installed.id &&
+              current.chatProvider.manifestUrl === manifestUrl
+              ? current.chatProvider.config
+              : {}
+          )
         }
       } as any)
 
@@ -509,6 +519,13 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('provider:getInstalled', async () => {
     const settings = normalizeSettings(settingsStore.store)
+    if (settings.chatProvider.installed?.id === SILICONFLOW_PROVIDER_ID) {
+      return {
+        installed: SILICONFLOW_INSTALLED,
+        manifest: SILICONFLOW_MANIFEST,
+        isBuiltinDefault: false
+      }
+    }
 
     // 用户安装过自定义 provider：原样返回
     if (settings.chatProvider.installed) {
@@ -527,6 +544,92 @@ app.whenReady().then(async () => {
       installed,
       manifest,
       isBuiltinDefault: true
+    }
+  })
+
+  ipcMain.handle('siliconflow:status', () =>
+    siliconFlowStatus(siliconFlowConfig(normalizeSettings(settingsStore.store)))
+  )
+
+  ipcMain.handle('image:pick', async () => {
+    if (imageSending) return { success: false, error: '图片正在发送，请稍后再选择' }
+    const result = await dialog.showOpenDialog({
+      properties: ['openFile'],
+      filters: [{ name: '图片', extensions: ['png', 'jpg', 'jpeg'] }]
+    })
+    if (result.canceled || !result.filePaths[0]) return { success: false, cancelled: true }
+    try {
+      const bytes = await readFile(result.filePaths[0])
+      if (bytes.length > 12 * 1024 * 1024) throw new Error('图片文件超过 12 MB')
+      const image = nativeImage.createFromBuffer(bytes)
+      if (image.isEmpty()) throw new Error('无法解析图片')
+      const size = image.getSize()
+      const scale = Math.min(1, 1600 / Math.max(size.width, size.height))
+      const resized =
+        scale < 1 ? image.resize({ width: Math.max(1, Math.round(size.width * scale)) }) : image
+      const dataUrl = resized.toDataURL()
+      validateImageDataUrl(dataUrl)
+      if (imageSending) return { success: false, error: '图片正在发送，请稍后再选择' }
+      selectedImage = { token: randomUUID(), dataUrl }
+      return { success: true, token: selectedImage.token, preview: dataUrl }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : '图片读取失败' }
+    }
+  })
+
+  ipcMain.handle('image:analyze', async (_event, token: unknown, prompt: unknown) => {
+    if (!selectedImage || token !== selectedImage.token)
+      return { success: false, error: '请重新选择图片' }
+    if (typeof prompt !== 'string' || prompt.length > 2000)
+      return { success: false, error: '提示词过长' }
+    try {
+      const config = siliconFlowConfig(normalizeSettings(settingsStore.store))
+      const text = await createSiliconFlowClient(config).analyzeImage(selectedImage.dataUrl, prompt)
+      return { success: true, text }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : '图片识别失败' }
+    }
+  })
+
+  ipcMain.handle('image:send', async (_event, token: unknown) => {
+    if (!selectedImage || token !== selectedImage.token)
+      return { success: false, error: '请重新选择图片' }
+    if (imageSending) return { success: false, error: '图片正在发送，请勿重复操作' }
+    if (runtime?.isRunning() || engineStarting)
+      return { success: false, error: '请先暂停引擎再手动发送图片' }
+    const appType = normalizeSettings(settingsStore.store).appType
+    if (process.platform !== 'win32')
+      return { success: false, error: '手动发送图片目前仅支持 Windows' }
+    if (appType !== 'wechat' && appType !== 'wework') {
+      return { success: false, error: '手动发送图片目前仅支持微信和企业微信' }
+    }
+    imageSending = true
+    const imageToSend = selectedImage
+    try {
+      const image = nativeImage.createFromDataURL(imageToSend.dataUrl)
+      if (image.isEmpty()) throw new Error('图片已失效，请重新选择')
+      BrowserWindow.getFocusedWindow()?.minimize()
+      await new Promise((resolve) => setTimeout(resolve, 400))
+      await sendImageAction(appType, image, async () => {
+        // Stopping the engine clears layout memory. Manual send measures it again
+        // using the selected provider or saved boxes, without starting auto replies.
+        const settings = normalizeSettings(settingsStore.store)
+        const { device } = await buildDevice(
+          appType,
+          settings,
+          settings.vision.apiKey,
+          (type, content) => console.log(`[ImageSend:${type}] ${content}`)
+        )
+        device.setAppType(appType)
+        const measured = await device.measureLayout()
+        if (!measured.success) throw new Error(measured.error || '手动图片发送前的布局测量失败')
+      })
+      if (selectedImage?.token === imageToSend.token) selectedImage = null
+      return { success: true }
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : '发送图片失败' }
+    } finally {
+      imageSending = false
     }
   })
 
@@ -667,10 +770,19 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('engine:updateConfig', async (_event, config) => {
+    // Provider instances capture their original credentials; rebuild on the next start.
+    if (runtime?.isRunning()) await runtime.stopSession('settings_changed')
     const settings = normalizeSettings(config || settingsStore.store)
     if (runtimeDevice) {
       // setApiKey 在 BoxSelectDevice 上是 no-op，对 RPADevice 才生效。
       runtimeDevice.setApiKey(settings.vision.apiKey)
+      if (runtimeDevice instanceof RPADevice && typeof runtimeDevice.setModel === 'function') {
+        if (settings.chatProvider.installed?.id === SILICONFLOW_PROVIDER_ID) {
+          runtimeDevice.setVisionClient(createSiliconFlowClient(siliconFlowConfig(settings)))
+        } else {
+          runtimeDevice.setModel(settings.vision.model)
+        }
+      }
       runtimeDevice.setAppType(settings.appType)
     }
     if (runtime) {
@@ -680,10 +792,11 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('engine:testConnection', async (_event, config) => {
-    const apiKey = config?.apiKey || normalizeSettings(settingsStore.store).vision.apiKey
+    const savedVision = normalizeSettings(settingsStore.store).vision
+    const apiKey = config?.apiKey ?? savedVision.apiKey
     const client = new AIClient({
       apiKey,
-      model: FIXED_ARK_MODEL,
+      model: config?.model ?? savedVision.model,
       baseURL: FIXED_ARK_BASE_URL
     })
     return client.testConnection()
@@ -769,7 +882,7 @@ app.whenReady().then(async () => {
   })
 
   // ── Skill HTTP Server（OpenClaw 远程启动 / 暂停接入点） ──
-  startSkillServer(skillEngineController)
+  void startSkillServer(skillEngineController)
 
   createWindow()
 
@@ -796,10 +909,14 @@ app.on('before-quit', () => {
 // ── 引擎启动 / 暂停核心逻辑（IPC 与 Skill HTTP Server 共用） ──
 
 async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
+  if (imageSending)
+    return { ok: false, reason: 'operation_in_progress', message: '图片正在发送，请稍后启动引擎' }
+  if (engineStarting) return { ok: false, reason: 'operation_in_progress', message: '引擎正在启动' }
   if (runtime?.isRunning()) {
     return { ok: false, reason: 'already_running', message: '引擎已在运行中' }
   }
 
+  engineStarting = true
   try {
     const settings = normalizeSettings(rawConfig || settingsStore.store)
     const appType: AppType = settings.appType || 'wechat'
@@ -807,7 +924,8 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
     const providerNeedsVisionKey =
       !settings.chatProvider.installed ||
       settings.chatProvider.installed.id === BUILTIN_DOUBAO_PROVIDER_ID
-    const needsVisionKey = startupStrategy === 'vlm' || providerNeedsVisionKey
+    const isSiliconFlow = settings.chatProvider.installed?.id === SILICONFLOW_PROVIDER_ID
+    const needsVisionKey = (startupStrategy === 'vlm' && !isSiliconFlow) || providerNeedsVisionKey
 
     if (needsVisionKey && !settings.vision.apiKey) {
       return { ok: false, reason: 'no_vision_key', message: '请先填写视觉接口密钥' }
@@ -818,9 +936,12 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
     if (!settings.chatProvider.installed) {
       const loaded = await loadBuiltinDoubaoProvider({
         ...settings.chatProvider.config,
-        apiKey: settings.vision.apiKey
+        apiKey: settings.vision.apiKey,
+        model: settings.vision.model
       })
       provider = loaded.provider
+    } else if (isSiliconFlow) {
+      provider = createSiliconFlowProvider(createSiliconFlowClient(siliconFlowConfig(settings)))
     } else {
       const installedManifest = await getInstalledProviderManifest(settings.chatProvider.installed)
       // doubao（无论是用户主动装的还是内置的）apiKey 由视觉密钥共享提供，不强校验
@@ -841,7 +962,11 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
       }
 
       const effectiveConfig = isDoubao
-        ? { ...settings.chatProvider.config, apiKey: settings.vision.apiKey }
+        ? {
+            ...settings.chatProvider.config,
+            apiKey: settings.vision.apiKey,
+            model: settings.vision.model
+          }
         : settings.chatProvider.config
 
       const loaded = await loadInstalledProvider(settings.chatProvider.installed, effectiveConfig)
@@ -877,7 +1002,11 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
       appType,
       engineVersion: app.getVersion(),
       providerId: settings.chatProvider.installed?.id ?? BUILTIN_DOUBAO_PROVIDER_ID,
-      model: settings.chatProvider.config?.model || FIXED_ARK_MODEL
+      model: isSiliconFlow
+        ? siliconFlowStatus(siliconFlowConfig(settings)).model
+        : providerNeedsVisionKey
+          ? settings.vision.model
+          : settings.chatProvider.config?.model || FIXED_ARK_MODEL
     })
 
     const onTrace = (input: TraceStepInput): void => {
@@ -907,12 +1036,16 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
       onLog: log,
       onTrace,
       getMemoryCards: () => getExperienceStore().getActiveCardBriefs(),
-      onSessionEnd: () => recorder.endSession()
+      onSessionEnd: () => {
+        recorder.endSession()
+        notifyEngineStateChanged('idle')
+      }
     })
 
-    runtime.startSession().catch((err: any) => {
-      console.error('[Main] Runtime session error:', err)
-    })
+    await runtime.startSession()
+    if (!runtime.isRunning()) {
+      return { ok: false, reason: 'engine_failed', message: '引擎初始化失败，请检查运行日志' }
+    }
 
     notifyEngineStateChanged('running')
 
@@ -923,6 +1056,8 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
       reason: 'engine_failed',
       message: error?.message || String(error)
     }
+  } finally {
+    engineStarting = false
   }
 }
 
@@ -1000,7 +1135,12 @@ async function buildDevice(
   if (effective === 'vlm') {
     const rpa = new RPADevice()
     rpa.setAppType(appType)
-    rpa.setApiKey(apiKey)
+    if (settings.chatProvider.installed?.id === SILICONFLOW_PROVIDER_ID) {
+      rpa.setVisionClient(createSiliconFlowClient(siliconFlowConfig(settings)))
+    } else {
+      rpa.setApiKey(apiKey)
+      rpa.setModel(settings.vision.model)
+    }
     return { device: rpa, strategy: 'vlm' }
   }
 
@@ -1044,119 +1184,3 @@ const skillEngineController: SkillEngineController = {
 
 // In this file you can include the rest of your app's specific main process
 // code. You can also put them in separate files and require them here.
-
-const VALID_APP_TYPES: AppType[] = [
-  'wechat',
-  'wework',
-  'dingtalk',
-  'lark',
-  'slack',
-  'telegram',
-  'generic'
-]
-const VALID_CAPTURE_STRATEGIES: CaptureStrategy[] = ['auto', 'vlm', 'box-select']
-
-function coerceAppType(raw: unknown): AppType {
-  return typeof raw === 'string' && (VALID_APP_TYPES as string[]).includes(raw)
-    ? (raw as AppType)
-    : 'wechat'
-}
-
-function coerceStrategy(raw: unknown, fallback: CaptureStrategy = 'auto'): CaptureStrategy {
-  return typeof raw === 'string' && (VALID_CAPTURE_STRATEGIES as string[]).includes(raw)
-    ? (raw as CaptureStrategy)
-    : fallback
-}
-
-function coerceRect(raw: unknown): BoxRegions['contactList'] | null {
-  if (!raw || typeof raw !== 'object') return null
-  const r = raw as Record<string, unknown>
-  const x = Number(r.x),
-    y = Number(r.y),
-    w = Number(r.width),
-    h = Number(r.height)
-  if (![x, y, w, h].every((n) => Number.isFinite(n))) return null
-  return { x, y, width: w, height: h }
-}
-
-function coerceRegions(raw: unknown): BoxRegions | null {
-  if (!raw || typeof raw !== 'object') return null
-  const r = raw as Record<string, unknown>
-  const contactList = coerceRect(r.contactList)
-  const chatMain = coerceRect(r.chatMain)
-  const inputBox = coerceRect(r.inputBox)
-  if (!contactList || !chatMain || !inputBox) return null
-  return {
-    contactList,
-    chatMain,
-    inputBox,
-    unreadIndicator: coerceRect(r.unreadIndicator),
-    displayId: typeof r.displayId === 'number' ? r.displayId : undefined,
-    scaleFactor: typeof r.scaleFactor === 'number' ? r.scaleFactor : undefined,
-    capturedAt: typeof r.capturedAt === 'number' ? r.capturedAt : Date.now()
-  }
-}
-
-function normalizeCapture(raw: unknown): Partial<Record<AppType, PerAppCapture>> {
-  const out: Partial<Record<AppType, PerAppCapture>> = {}
-  if (!raw || typeof raw !== 'object') return out
-  for (const key of VALID_APP_TYPES) {
-    const value = (raw as Record<string, unknown>)[key]
-    if (!value || typeof value !== 'object') continue
-    const v = value as Record<string, unknown>
-    out[key] = {
-      strategy: coerceStrategy(v.strategy),
-      regions: coerceRegions(v.regions)
-    }
-  }
-  return out
-}
-
-function normalizeSettings(raw: any): AppSettings {
-  const oldApiKey = typeof raw?.apiKey === 'string' ? raw.apiKey : ''
-  const oldModel = typeof raw?.model === 'string' && raw.model ? raw.model : FIXED_ARK_MODEL
-  const oldSystemPrompt = typeof raw?.systemPrompt === 'string' ? raw.systemPrompt : ''
-  const rawProviderConfig =
-    raw?.chatProvider?.config && typeof raw.chatProvider.config === 'object'
-      ? { ...raw.chatProvider.config }
-      : {}
-
-  // Keep arbitrary provider config keys, and only backfill legacy volcengine fields for old persisted settings.
-  if (rawProviderConfig.apiKey === undefined && oldApiKey) {
-    rawProviderConfig.apiKey = oldApiKey
-  }
-  if (rawProviderConfig.model === undefined && oldModel) {
-    rawProviderConfig.model = oldModel
-  }
-  if (rawProviderConfig.systemPrompt === undefined && oldSystemPrompt) {
-    rawProviderConfig.systemPrompt = oldSystemPrompt
-  }
-
-  return {
-    locale: raw?.locale === 'en' ? 'en' : 'zh',
-    appType: coerceAppType(raw?.appType),
-    vision: {
-      apiKey: raw?.vision?.apiKey || oldApiKey || ''
-    },
-    chatProvider: {
-      manifestUrl: raw?.chatProvider?.manifestUrl || raw?.providerManifestUrl || '',
-      installed: raw?.chatProvider?.installed || null,
-      config: rawProviderConfig
-    },
-    defaultCaptureStrategy: coerceStrategy(raw?.defaultCaptureStrategy, 'auto'),
-    capture: normalizeCapture(raw?.capture)
-  }
-}
-
-function withSchemaDefaults(
-  schema: { properties: Record<string, { default?: unknown }> },
-  current: Record<string, any>
-): Record<string, any> {
-  const next = { ...current }
-  for (const [key, field] of Object.entries(schema.properties || {})) {
-    if (next[key] === undefined && field.default !== undefined) {
-      next[key] = field.default
-    }
-  }
-  return next
-}

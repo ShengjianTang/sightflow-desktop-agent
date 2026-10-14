@@ -300,6 +300,27 @@ button:focus-visible {
   max-width: 960px;
 }
 
+.provider-install-row {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.provider-install-row .form-input {
+  min-width: 0;
+}
+
+.provider-install-row .btn {
+  flex-shrink: 0;
+  min-width: 76px;
+  white-space: nowrap;
+}
+
+.provider-config-card .form-hint {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
 .provider-list {
   display: grid;
   gap: 10px;
@@ -540,6 +561,20 @@ button:focus-visible {
 }
 
 /* ─── Message Log ─── */
+.image-workflow {
+  border-top: 1px solid var(--glass-border);
+  border-bottom: 1px solid var(--glass-border);
+  padding: 14px 0;
+  margin: 12px 0;
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+}
+.image-workflow-title { font-size: 13px; font-weight: 600; }
+.image-workflow .btn { justify-self: start; }
+.image-workflow-preview { width: 100%; max-height: 170px; object-fit: contain; background: var(--bg-glass); }
+.image-workflow-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.image-workflow-result { font-size: 12px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
 .message-log {
   min-height: 160px;
   max-height: 360px;

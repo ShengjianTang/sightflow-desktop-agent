@@ -124,13 +124,18 @@ export function hasImageChanged(
 // 用途：回复结束后轮询 chatMainArea 截图差异，发现界面变化说明有新消息
 
 import { AppType } from './types'
-import { captureChatMainArea } from './screenshot-utils'
+import { captureChatMainArea, clearScreenshotCache } from './screenshot-utils'
 
 /** baseline 截图（内存，app 关闭后丢失） */
 let chatBaseline: Electron.NativeImage | null = null
 
+export function setChatBaselineImage(image: Electron.NativeImage): void {
+  chatBaseline = image
+}
+
 /** 保存当前 chatMainArea 截图作为 baseline */
 export async function setChatBaseline(appType: AppType): Promise<boolean> {
+  clearScreenshotCache()
   const screenshot = await captureChatMainArea(appType)
   if (screenshot) {
     chatBaseline = screenshot
@@ -163,6 +168,7 @@ export function hasChatBaseline(): boolean {
 export async function checkChatAreaDiff(appType: AppType): Promise<{
   hasDiff: boolean
   hasBaseline: boolean
+  error?: string
 }> {
   if (!chatBaseline) {
     console.log('[ChatDiff] 无 baseline，无法对比')
@@ -172,7 +178,11 @@ export async function checkChatAreaDiff(appType: AppType): Promise<{
   const current = await captureChatMainArea(appType)
   if (!current) {
     console.log('[ChatDiff] 截图失败，继续轮询')
-    return { hasDiff: false, hasBaseline: true }
+    return {
+      hasDiff: false,
+      hasBaseline: true,
+      error: '聊天区截图失败，请确认目标窗口可见并重新识别布局'
+    }
   }
 
   const result = compareImages(chatBaseline, current, {

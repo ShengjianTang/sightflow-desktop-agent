@@ -108,6 +108,11 @@ interface ProviderInput {
   appType: AppType
   currentContact?: string
   ocrText?: string
+  captureContext?: 'full_window' | 'chat_area'
+  observation?: { conversationId: string; historyId: string; chatAreaBbox?: BBox }
+  recentSentMessages?: string[]
+  conversationHistory?: ConversationMessage[]
+  pendingIncomingMessages?: ConversationMessage[]
   // Experience cards injected at runtime (work memory); a Provider may fold these into its system prompt
   memoryCards?: MemoryCardBrief[]
 }
@@ -120,9 +125,23 @@ Here `screenshot` is a screenshot string in `data:image/...;base64,...` form. If
 Events a Provider can return:
 
 ```ts
+type BBox = [number, number, number, number] // screenshot coordinates, 0–1000
+interface ConversationMessage {
+  sender: 'incoming' | 'self'
+  kind: 'text' | 'image' | 'emoji'
+  text: string
+}
+
 type ProviderEvent =
   | { type: 'thinking'; content: string }
-  | { type: 'reply_text'; content: string }
+  | {
+      type: 'reply_text'
+      content: string
+      latestMessage?: string
+      sender?: 'incoming' | 'self' | 'unknown'
+      senderBbox?: BBox
+      messages?: (ConversationMessage & { senderBbox: BBox })[]
+    }
   | { type: 'skip' }
   | { type: 'error'; error: string }
 ```
@@ -131,6 +150,10 @@ type ProviderEvent =
 - `reply_text` — the app sends this text to the current chat window.
 - `skip` — no reply this round, e.g. the last message was your own, a system message, or undecidable.
 - `error` — this round failed; the error is shown in the run log.
+
+`messages` must contain complete visible conversation bubbles with identifiable senders, including your own, in top-to-bottom order. Clipped history at the top can be omitted; the latest bubbles at the bottom cannot. Each entry carries its own avatar coordinates. The final entry must agree with `latestMessage`, `sender`, and `senderBbox`. Do not silently drop malformed entries: they may contain an outgoing reply. Built-in providers require this evidence from the first observation. Legacy text-only custom providers retain first-reply compatibility; subsequent replies need the ordered transcript and sender evidence.
+
+`conversationHistory` contains completed turns; `pendingIncomingMessages` contains input retained after a cancelled send. Both are isolated by conversation. Combine pending input with the visible unanswered burst and generate one coherent reply using the earlier context, rather than answering only the last sentence. Completed history is not new input. The host validates message boundaries before sending and consumes each terminal result once. Users continue to enter credentials in settings or supported environment variables; never put credentials in messages or logs.
 
 ## Installing a Provider in the app
 
@@ -161,11 +184,11 @@ It is wired up as follows:
 3. On receiving `input.screenshot`, the Provider calls the Volcengine Ark OpenAI-compatible API:
 
 ```text
-POST https://ark.cn-beijing.volces.com/api/v3/chat/completions
+POST https://ark.cn-beijing.volces.com/api/v3/responses
 ```
 
-4. The request uses `messages`, passing the screenshot as `image_url` and the reply instructions as a text message.
-5. If the model returns empty content or `[SKIP]`, the Provider returns `skip`; otherwise it returns `reply_text`, and the desktop client completes the send.
+4. The request uses `input` with `input_image` and `input_text`, including completed context and the pending incoming batch.
+5. Parse the structured decision, reviewing uncertain or incomplete evidence once. Valid replies include the transcript and sender evidence for host validation before sending; unresolved decisions return `skip`.
 
 During local development you can install the bundled example by entering an address like the following on the settings page:
 

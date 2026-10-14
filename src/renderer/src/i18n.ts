@@ -36,7 +36,11 @@ const translations = {
     'settings.visionApiKey': '视觉接口密钥',
     'settings.visionApiKey.placeholder': '输入火山方舟 API 密钥',
     'settings.visionApiKey.hint': '用于布局分析、未读检测和界面定位',
-    'settings.visionModel': '视觉模型',
+    'settings.visionModel': '视觉模型 / 推理接入点 ID',
+    'settings.visionModel.placeholder': '填写已开通的模型 ID 或 ep- 接入点 ID',
+    'settings.visionModel.hint':
+      '请填写火山方舟控制台中已开通、支持图片输入的模型 ID 或推理接入点 ID；测试连接也使用此值。',
+    'settings.visionModel.required': '请填写模型或推理接入点 ID',
     'settings.visionBaseUrl': '视觉服务地址',
     'settings.testConnection': '测试连接',
     'settings.testConnection.testing': '测试中...',
@@ -64,7 +68,7 @@ const translations = {
     // Toast
     'toast.engineStarted': '引擎已启动',
     'toast.engineStopped': '引擎已停止',
-    'toast.startFailed': '启动失败',
+    'toast.startFailed': '启动失败'
   },
   en: {
     'app.title': 'SightFlow Desktop',
@@ -94,7 +98,11 @@ const translations = {
     'settings.visionApiKey': 'Vision API Key',
     'settings.visionApiKey.placeholder': 'Enter your Volcengine Ark API Key',
     'settings.visionApiKey.hint': 'Used for layout measurement and UI detection',
-    'settings.visionModel': 'Vision Model',
+    'settings.visionModel': 'Vision model / endpoint ID',
+    'settings.visionModel.placeholder': 'Enter an enabled model ID or ep- endpoint ID',
+    'settings.visionModel.hint':
+      'Use an enabled, vision-capable model or endpoint ID from the Ark console. Connection tests use this value.',
+    'settings.visionModel.required': 'Enter a model or endpoint ID',
     'settings.visionBaseUrl': 'Vision Base URL',
     'settings.testConnection': 'Test Connection',
     'settings.testConnection.testing': 'Testing...',
@@ -121,11 +129,11 @@ const translations = {
 
     'toast.engineStarted': 'Engine started',
     'toast.engineStopped': 'Engine stopped',
-    'toast.startFailed': 'Failed to start',
+    'toast.startFailed': 'Failed to start'
   }
 } as const
 
-type TranslationKey = keyof typeof translations['zh']
+type TranslationKey = keyof (typeof translations)['zh']
 
 let currentLocale: Locale = 'zh'
 

@@ -12,12 +12,9 @@ async function getOpenWindowsSafe(): Promise<any[]> {
     const timeoutPromise = new Promise((_, reject) => {
       setTimeout(() => reject(new Error('active-win getOpenWindows timeout')), 5000)
     })
-    
+
     // 如果系统没有给权限，activeWin在某些版本可能卡死，强制5秒超时
-    const windows = await Promise.race([
-      activeWin.getOpenWindows(),
-      timeoutPromise
-    ])
+    const windows = await Promise.race([activeWin.getOpenWindows(), timeoutPromise])
     return windows as any[]
   } catch (err: any) {
     console.error('[window-utils] getOpenWindowsSafe error or timeout:', err.message)
@@ -30,7 +27,7 @@ export function matchWechatType(name: string, appType: AppType) {
     return ['‎WhatsApp', '‎WhatsApp.app', '‎WhatsApp.exe', 'WhatsApp'].includes(name)
   }
   const wechatName =
-    appType === 'wechat' ? ['微信', '微信.app', 'WeChat'] : ['企业微信', '企业微信.app']
+    appType === 'wechat' ? ['微信', '微信.app', 'WeChat', 'Weixin'] : ['企业微信', '企业微信.app']
   return wechatName.includes(name)
 }
 
@@ -70,11 +67,12 @@ type PlatformWindow = {
 async function getWechatWindowInWin(appType: AppType): Promise<PlatformWindow | null> {
   try {
     const { windowManager } = require('node-window-manager')
-    let activeWechatWindow = windowManager.getActiveWindow()
+    const activeWechatWindow = windowManager.getActiveWindow()
     if (activeWechatWindow && matchWechatType(activeWechatWindow.getTitle(), appType)) {
       return activeWechatWindow
     }
-    const foundWindow = windowManager.getWindows()
+    const foundWindow = windowManager
+      .getWindows()
       ?.find((window: any) => matchWechatType(window.getTitle(), appType) && window.isVisible())
     return foundWindow || null
   } catch (err: any) {
@@ -106,10 +104,18 @@ function getWindowBounds(window: PlatformWindow): {
   return null
 }
 
-function validateWindowBounds(bounds: { x?: number; y?: number; width?: number; height?: number } | null): bounds is { x: number; y: number; width: number; height: number } {
+function validateWindowBounds(
+  bounds: { x?: number; y?: number; width?: number; height?: number } | null
+): bounds is { x: number; y: number; width: number; height: number } {
   if (!bounds) return false
-  if (bounds.x === undefined || bounds.y === undefined || !bounds.width || !bounds.height ||
-     (bounds.width && bounds.width < 100) || (bounds.height && bounds.height < 100)) {
+  if (
+    bounds.x === undefined ||
+    bounds.y === undefined ||
+    !bounds.width ||
+    !bounds.height ||
+    (bounds.width && bounds.width < 100) ||
+    (bounds.height && bounds.height < 100)
+  ) {
     return false
   }
   const isVisible = bounds.width > 0 && bounds.height > 0
@@ -120,14 +126,15 @@ interface WechatWindowInfoCache {
   result: any | null
   timestamp: number
 }
-const WINDOW_INFO_CACHE_DURATION = 5000 // 5 seconds cache
+// Short cache so window moves do not leave stale click targets.
+const WINDOW_INFO_CACHE_DURATION = 500
 const wechatWindowInfoCache = new Map<AppType, WechatWindowInfoCache>()
 const wechatWindowInfoPendingPromises = new Map<AppType, Promise<any>>()
 
-export async function getWechatWindowInfo(appType: AppType) {
+export async function getWechatWindowInfo(appType: AppType, forceRefresh = false) {
   const cached = wechatWindowInfoCache.get(appType)
   const now = Date.now()
-  if (cached && now - cached.timestamp < WINDOW_INFO_CACHE_DURATION) {
+  if (!forceRefresh && cached && now - cached.timestamp < WINDOW_INFO_CACHE_DURATION) {
     return cached.result
   }
 
@@ -136,11 +143,22 @@ export async function getWechatWindowInfo(appType: AppType) {
 
   const queryPromise = (async () => {
     try {
-      const wechatWindow = IS_WINDOWS ? await getWechatWindowInWin(appType) : IS_MAC ? await getWechatWindowInMac(appType) : null
-      if (!wechatWindow) return null
+      const wechatWindow = IS_WINDOWS
+        ? await getWechatWindowInWin(appType)
+        : IS_MAC
+          ? await getWechatWindowInMac(appType)
+          : null
+      if (!wechatWindow) {
+        wechatWindowInfoCache.delete(appType)
+        return null
+      }
 
-      const bounds = getWindowBounds(wechatWindow)
-      if (!validateWindowBounds(bounds)) return null
+      const nativeBounds = getWindowBounds(wechatWindow)
+      if (!validateWindowBounds(nativeBounds)) return null
+
+      // Win32 GetWindowRect uses screen coordinates; Electron capture and displays use DIP.
+      // Convert the whole rectangle so displays with different origins/scales work too.
+      let bounds = IS_WINDOWS ? screen.screenToDipRect(null, nativeBounds) : nativeBounds
 
       const display = screen.getDisplayMatching({
         x: bounds.x,
@@ -149,11 +167,67 @@ export async function getWechatWindowInfo(appType: AppType) {
         height: bounds.height
       })
 
+      // Maximized Win32 windows include invisible borders outside the display.
+      // Normalize capture bounds to the visible portion so bbox and crop still agree.
+      const left = Math.max(bounds.x, display.bounds.x)
+      const top = Math.max(bounds.y, display.bounds.y)
+      const right = Math.min(bounds.x + bounds.width, display.bounds.x + display.bounds.width)
+      const bottom = Math.min(bounds.y + bounds.height, display.bounds.y + display.bounds.height)
+      if (right - left < bounds.width * 0.9 || bottom - top < bounds.height * 0.9) {
+        console.warn('[window-utils] 目标窗口跨屏或大部分位于屏幕外，请将窗口完整放在一个显示器内')
+        return null
+      }
+      bounds = { x: left, y: top, width: right - left, height: bottom - top }
+
       const result = {
         wechatWindow,
+        foreground: IS_WINDOWS
+          ? require('node-window-manager').windowManager.getActiveWindow()?.id === wechatWindow.id
+          : true,
         bounds: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height },
         wechatType: appType,
         display: { id: display.id, scaleFactor: display.scaleFactor, bounds: display.bounds }
+      }
+      const previous = wechatWindowInfoCache.get(appType)?.result
+      const resized =
+        previous &&
+        (previous.bounds.width !== bounds.width ||
+          previous.bounds.height !== bounds.height ||
+          previous.display.scaleFactor !== display.scaleFactor ||
+          previous.display.id !== display.id ||
+          previous.wechatWindow.id !== wechatWindow.id)
+      const moved = previous && (previous.bounds.x !== bounds.x || previous.bounds.y !== bounds.y)
+      if (resized || moved) {
+        const { clearLayoutCache, getLayoutCache, setLayoutCache, bboxToScreenCoords } =
+          await import('./vision-utils')
+        const { clearScreenshotCache } = await import('./screenshot-utils')
+        clearScreenshotCache()
+        const layout = getLayoutCache(appType)
+        if (layout?.chatMainArea?.bbox) {
+          if (resized) {
+            const { clearChatBaseline } = await import('./image-compare')
+            clearLayoutCache(appType)
+            clearChatBaseline()
+          } else {
+            for (const item of [
+              layout.chatEntranceArea,
+              layout.firstContact,
+              layout.searchInputBox,
+              layout.headerArea,
+              layout.chatMainArea,
+              layout.messageInputArea
+            ]) {
+              if (item?.bbox)
+                item.coordinates = bboxToScreenCoords(item.bbox, bounds, display.scaleFactor)
+            }
+            setLayoutCache(appType, layout)
+          }
+        }
+        console.log('[window-utils] Window geometry changed; refreshed layout coordinates', {
+          previous: previous.bounds,
+          current: bounds,
+          remeasure: Boolean(resized)
+        })
       }
       wechatWindowInfoCache.set(appType, { result, timestamp: Date.now() })
       return result
@@ -169,9 +243,13 @@ export async function getWechatWindowInfo(appType: AppType) {
   return queryPromise
 }
 
-export const getWindowInfo = async (appType: AppType = 'wechat', includeScreenshot: boolean = true) => {
+export const getWindowInfo = async (
+  appType: AppType = 'wechat',
+  includeScreenshot: boolean = true,
+  forceRefresh = false
+) => {
   if (!includeScreenshot) {
-    const result = await getWechatWindowInfo(appType)
+    const result = await getWechatWindowInfo(appType, forceRefresh)
     if (!result) return null
     return {
       wechatWindow: result.wechatWindow,

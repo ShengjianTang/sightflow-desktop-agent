@@ -6,7 +6,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import logoUrl from './assets/logo.png'
-import { showToast } from './App'
+import { showToast } from './toast'
 
 // ── 与 src/core/trace / memory 对齐的本地类型（renderer 约定：不跨层 import） ──
 

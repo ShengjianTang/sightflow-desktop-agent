@@ -46,7 +46,7 @@ An enterprise's heaviest work does not live inside an LLM API. It lives **on the
 - **Long horizons** — read → judge → act → follow up → recover. It is never one button click.
 - **Tacit experience** — the real know-how lives in every judgment a senior operator makes, not in any document.
 
-Large language models solved *thinking* and *speaking*. They have **not** yet solved *learning the job* and *doing it well*. SightFlow is the desktop runtime that closes that gap — an agent that **sees** any interface, **thinks** in context, **acts** like a human operator, and **learns** from every execution.
+Large language models solved _thinking_ and _speaking_. They have **not** yet solved _learning the job_ and _doing it well_. SightFlow is the desktop runtime that closes that gap — an agent that **sees** any interface, **thinks** in context, **acts** like a human operator, and **learns** from every execution.
 
 ---
 
@@ -60,11 +60,11 @@ flowchart LR
     LEARN -. compounds into memory .-> THINK
 ```
 
-| Stage | What happens |
-| :-- | :-- |
-| **See** | A vision model understands any software UI and its current state. |
-| **Think** | The agent plans using context and history to decide *what to do*. |
-| **Do** | It clicks, types, switches windows, sends, and records — exactly like a human operator. |
+| Stage     | What happens                                                                                |
+| :-------- | :------------------------------------------------------------------------------------------ |
+| **See**   | A vision model understands any software UI and its current state.                           |
+| **Think** | The agent plans using context and history to decide _what to do_.                           |
+| **Do**    | It clicks, types, switches windows, sends, and records — exactly like a human operator.     |
 | **Learn** | Every execution is written as a structured **work-trace**, building durable working memory. |
 
 > This is not an app. It is a **working memory engine** that puts AI on the job.
@@ -87,10 +87,10 @@ work-trace = {
 
 Continuously written and replayable step by step, the runtime offers **three capabilities ordinary RPA cannot**:
 
-| Capability | Why it matters |
-| :-- | :-- |
-| 🔁 **Replay** | When something breaks, review every step — down to the decision behind it. |
-| 📊 **Eval** | Swap models or versions and compare outcomes consistently. |
+| Capability     | Why it matters                                                                                    |
+| :------------- | :------------------------------------------------------------------------------------------------ |
+| 🔁 **Replay**  | When something breaks, review every step — down to the decision behind it.                        |
+| 📊 **Eval**    | Swap models or versions and compare outcomes consistently.                                        |
 | 🧬 **Inherit** | The judgment behind a task is captured once and reused, instead of living only in someone's head. |
 
 > Others record **the steps**. SightFlow records **why each step was taken**. That is the leap from **RPA** to a true **Agent Runtime**.
@@ -117,7 +117,7 @@ From WeChat and WeCom to **any desktop software**, SightFlow lets AI work where 
 
 SightFlow Desktop Agent is a cross-platform client built on **Electron · electron-vite · React · TypeScript**, driven by a Vision-Language Model (VLM).
 
-**Prerequisites:** Node.js (LTS) and npm.
+**Prerequisites:** Node.js 22 LTS and npm. Windows native dependencies also need Python and the Visual Studio Desktop development with C++ workload.
 
 ### 1. Install dependencies
 
@@ -132,6 +132,8 @@ npm run dev
 ```
 
 > On first launch, pick your **target application** and complete the region selection, then open **Settings** to enter your API key and confirm the active Provider.
+
+[Runtime configuration and failure handling (中文)](./docs/configuration.zh-CN.md) documents each configuration entry and the offline checks.
 
 ### 3. Build a release
 
@@ -159,13 +161,15 @@ Desktop configuration has two layers:
 
 1. Open [Volcengine Console → Ark](https://console.volcengine.com/ark), enable the service, and generate your API key.
 2. Launch the app and click the settings button at the bottom-right of the main window.
-3. Under **Base configuration**, enter the API key. The default Base URL `https://ark.cn-beijing.volces.com/api/v3` rarely needs changing.
-4. Under **Agent**, select the active Provider. The built-in default is **Doubao Seed** (`doubao-seed-2-0-lite-260215`).
+3. In **Settings → Base configuration → Vision API Key**, enter your Ark API key manually. The default **Vision model / endpoint ID** is `doubao-seed-evolving`; use an enabled, vision-capable `ep-` endpoint ID from your Ark console if needed. The built-in Base URL `https://ark.cn-beijing.volces.com/api/v3` is read-only and the client uses `/responses`. Click **Test connection**, then save.
+4. Under **Agent**, select the active Provider. The built-in **Doubao Seed** shares this key and model ID with vision. HTTP 404 may indicate an unavailable or unauthorized model/endpoint; HTTP 401 more often points to the key.
+
+**Optional SiliconFlow vision:** Enter and save a SiliconFlow API key and vision model in **Settings → Agent → SiliconFlow multimodal** (default `Qwen/Qwen3-VL-30B-A3B-Instruct`). An empty key falls back to `SILICONFLOW_API_KEY` in the launch environment; `SILICONFLOW_VISION_MODEL` is an optional model fallback. The image tool can analyze local images and, when paused and explicitly confirmed, send one to the active Windows WeChat/WeCom conversation. Ark Doubao model IDs cannot simply be used with the SiliconFlow endpoint; use the built-in Doubao Seed agent for Ark. Saved keys reside in the local unencrypted `settings.json`. See [runtime configuration](./docs/configuration.zh-CN.md).
 
 ### Interface preview
 
-| Main | Base Configuration | Agent / Provider |
-| :--: | :--: | :--: |
+|                                     Main                                     |                                      Base Configuration                                      |                                         Agent / Provider                                          |
+| :--------------------------------------------------------------------------: | :------------------------------------------------------------------------------------------: | :-----------------------------------------------------------------------------------------------: |
 | <img width="240" alt="SightFlow main window" src="./docs/images/main.png" /> | <img width="360" alt="SightFlow base configuration" src="./docs/images/settings-base.png" /> | <img width="360" alt="SightFlow agent configuration" src="./docs/images/settings-provider.png" /> |
 
 ### Target applications & selection mode
@@ -177,7 +181,7 @@ The main window offers a **Target Application** shortcut that decides how the de
 - When manual selection is required, click **Start Selection** and outline three regions in order: the **conversation list**, the **chat content area**, and the **input box**.
 - Selections are saved locally per target application and reused on subsequent launches; you can re-select at any time.
 
-> VLM vs. manual selection only affects *how layout is measured*. Runtime screenshots, content analysis, reply generation, and message sending all consume the same layout result.
+> VLM vs. manual selection only affects _how layout is measured_. Runtime screenshots, content analysis, reply generation, and message sending all consume the same layout result.
 
 ### Provider Hub
 

@@ -4,6 +4,8 @@ import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { ProviderAdapter, ProviderEvent, ProviderInput } from '../core/session-types'
+import { fetchWithTimeout } from '../core/http-request'
+import { readVisibleMessages } from '../core/chat-messages'
 
 export const BUILTIN_DOUBAO_PROVIDER_ID = 'volcengine-ark'
 
@@ -77,7 +79,9 @@ interface ProviderBundleModule {
           run(input: ProviderInput): AsyncIterable<ProviderEvent>
         }
       }
-    | ((context: ProviderBundleContext) => { run(input: ProviderInput): AsyncIterable<ProviderEvent> })
+    | ((context: ProviderBundleContext) => {
+        run(input: ProviderInput): AsyncIterable<ProviderEvent>
+      })
 }
 
 export interface ProviderBundleContext {
@@ -114,8 +118,23 @@ export class BundleProviderAdapter implements ProviderAdapter {
 
     switch (event.type) {
       case 'thinking':
-      case 'reply_text':
         return typeof event.content === 'string'
+      case 'reply_text':
+        return (
+          typeof event.content === 'string' &&
+          Boolean(event.content.trim()) &&
+          (event.latestMessage === undefined || typeof event.latestMessage === 'string') &&
+          (event.messages === undefined || Boolean(readVisibleMessages(event.messages))) &&
+          (event.sender === undefined || ['incoming', 'self', 'unknown'].includes(event.sender)) &&
+          (event.senderBbox === undefined ||
+            (Array.isArray(event.senderBbox) &&
+              event.senderBbox.length === 4 &&
+              event.senderBbox.every(
+                (n: unknown) => typeof n === 'number' && Number.isFinite(n) && n >= 0 && n <= 1000
+              ) &&
+              event.senderBbox[2] > event.senderBbox[0] &&
+              event.senderBbox[3] > event.senderBbox[1]))
+        )
       case 'skip':
         return true
       case 'error':
@@ -240,7 +259,7 @@ export function validateProviderConfig(
   const required = manifest.configSchema.required || []
   for (const key of required) {
     const value = config[key]
-    if (value === undefined || value === null || value === '') {
+    if (value === undefined || value === null || (typeof value === 'string' && !value.trim())) {
       return { valid: false, error: `缺少必填项: ${key}` }
     }
   }
@@ -311,7 +330,10 @@ export async function loadInstalledProvider(
   }
 }
 
-async function loadProviderBundleModule(entryFile: string, manifest: ProviderBundleManifest): Promise<ProviderBundleModule> {
+async function loadProviderBundleModule(
+  entryFile: string,
+  manifest: ProviderBundleManifest
+): Promise<ProviderBundleModule> {
   if (shouldUseEsmLoader(manifest, entryFile)) {
     // ESM has no writable require cache, so append a query string to force a fresh module instance.
     const entryUrl = pathToFileURL(entryFile)
@@ -325,9 +347,7 @@ async function loadProviderBundleModule(entryFile: string, manifest: ProviderBun
   return runtimeRequire(resolvedEntry) as ProviderBundleModule
 }
 
-function resolveCreateProvider(
-  loaded: ProviderBundleModule
-):
+function resolveCreateProvider(loaded: ProviderBundleModule):
   | ((context: ProviderBundleContext) => {
       run(input: ProviderInput): AsyncIterable<ProviderEvent>
     })
@@ -336,7 +356,11 @@ function resolveCreateProvider(
     return loaded.createProvider
   }
 
-  if (loaded.default && typeof loaded.default === 'object' && typeof loaded.default.createProvider === 'function') {
+  if (
+    loaded.default &&
+    typeof loaded.default === 'object' &&
+    typeof loaded.default.createProvider === 'function'
+  ) {
     return loaded.default.createProvider
   }
 
@@ -380,18 +404,37 @@ function validateManifest(input: any): ProviderBundleManifest {
   if (typeof input.version !== 'string' || !input.version.trim()) {
     throw new Error('Manifest 缺少有效 version')
   }
+  for (const key of ['id', 'version']) {
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(input[key])) {
+      throw new Error(`Manifest ${key} 必须是安全的单级目录名`)
+    }
+  }
   if (typeof input.entry !== 'string' || !input.entry.trim()) {
     throw new Error('Manifest 缺少有效 entry')
   }
-  if (input.moduleType !== undefined && input.moduleType !== 'module' && input.moduleType !== 'commonjs') {
+  if (
+    input.moduleType !== undefined &&
+    input.moduleType !== 'module' &&
+    input.moduleType !== 'commonjs'
+  ) {
     throw new Error('Manifest moduleType 仅支持 "module" 或 "commonjs"')
   }
-  if (!Array.isArray(input.capabilities) || input.capabilities.length !== 1 || input.capabilities[0] !== 'chat') {
+  if (
+    !Array.isArray(input.capabilities) ||
+    input.capabilities.length !== 1 ||
+    input.capabilities[0] !== 'chat'
+  ) {
     throw new Error('Manifest capabilities 仅支持 ["chat"]')
   }
 
   const configSchema = input.configSchema
-  if (!configSchema || configSchema.type !== 'object' || typeof configSchema.properties !== 'object') {
+  if (
+    !configSchema ||
+    configSchema.type !== 'object' ||
+    !configSchema.properties ||
+    Array.isArray(configSchema.properties) ||
+    typeof configSchema.properties !== 'object'
+  ) {
     throw new Error('Manifest 缺少有效 configSchema')
   }
 
@@ -406,7 +449,10 @@ function validateManifest(input: any): ProviderBundleManifest {
       throw new Error(`字段 ${key} 缺少 title`)
     }
     if (field.type === 'select') {
-      if (!Array.isArray(field.enum) || field.enum.some((value: unknown) => typeof value !== 'string')) {
+      if (
+        !Array.isArray(field.enum) ||
+        field.enum.some((value: unknown) => typeof value !== 'string')
+      ) {
         throw new Error(`字段 ${key} 的 enum 无效`)
       }
     }
@@ -447,10 +493,5 @@ async function readUrlText(targetUrl: string): Promise<string> {
     throw new Error(`不支持的 provider URL 协议: ${url.protocol}`)
   }
 
-  const response = await fetch(url)
-  if (!response.ok) {
-    throw new Error(`下载失败: ${response.status} ${response.statusText}`)
-  }
-
-  return await response.text()
+  return fetchWithTimeout(url, {}, (response) => response.text(), 15_000, 'Provider 下载超时')
 }
