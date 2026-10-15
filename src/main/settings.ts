@@ -17,6 +17,7 @@ export interface AppSettings {
   siliconFlow: {
     apiKey: string
     model: string
+    replyModel?: string
   }
   chatProvider: {
     manifestUrl: string
@@ -154,6 +155,8 @@ export function normalizeSettings(raw: any): AppSettings {
             : oldModel
     },
     siliconFlow: {
+      replyModel:
+        typeof raw?.siliconFlow?.replyModel === 'string' ? raw.siliconFlow.replyModel.trim() : '',
       apiKey:
         typeof raw?.siliconFlow?.apiKey === 'string'
           ? raw.siliconFlow.apiKey.trim()

@@ -22,14 +22,19 @@ export function validateImageDataUrl(value: unknown): string {
 export class SiliconFlowClient {
   constructor(
     private readonly apiKey: string,
-    private readonly model: string = SILICONFLOW_DEFAULT_MODEL
+    readonly model: string = SILICONFLOW_DEFAULT_MODEL
   ) {}
 
   async detectVision(prompt: string, image: string): Promise<string> {
     return this.analyzeImage(image, prompt, '你是桌面界面视觉分析助手。严格按照用户要求输出。')
   }
 
-  async analyzeImage(image: string, prompt: string, systemPrompt?: string): Promise<string> {
+  async analyzeImage(
+    image: string,
+    prompt: string,
+    systemPrompt?: string,
+    signal?: AbortSignal
+  ): Promise<string> {
     if (!this.apiKey.trim())
       throw new Error('请在智能体配置中填写硅基流动 API Key，或设置 SILICONFLOW_API_KEY')
     if (!this.model.trim()) throw new Error('请配置硅基流动视觉模型')
@@ -50,6 +55,7 @@ export class SiliconFlowClient {
         `${SILICONFLOW_BASE_URL}/chat/completions`,
         {
           method: 'POST',
+          signal,
           headers: {
             Authorization: `Bearer ${this.apiKey.trim()}`,
             'Content-Type': 'application/json'

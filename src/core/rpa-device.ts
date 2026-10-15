@@ -40,6 +40,7 @@ import {
   setLayoutCache
 } from './rpa/vision-utils'
 import { getWechatWindowInfo, getWindowInfoSync } from './rpa/window-utils'
+import { PNG } from 'pngjs'
 
 export class RPADevice implements DesktopDevice {
   private appType: AppType = 'wechat'
@@ -47,6 +48,11 @@ export class RPADevice implements DesktopDevice {
   private lastReplyHeader: Buffer | null = null
   private observedHistory: Electron.NativeImage | null = null
   private observation: ChatObservation | undefined
+  private panelCapture = false
+  private pendingEditor: Buffer | undefined
+  setReplyPanelCapture(enabled: boolean): void {
+    this.panelCapture = enabled
+  }
   private layoutWait: {
     hash: string
     retryAfter: number
@@ -224,6 +230,30 @@ export class RPADevice implements DesktopDevice {
           : undefined,
       chatAreaBbox: getLayoutCache(this.appType)?.chatMainArea?.bbox
     }
+    const layout = getLayoutCache(this.appType)
+    const editor = layout?.messageInputArea?.bbox
+    if (this.panelCapture && layout?.headerArea?.bbox && layout.chatMainArea?.bbox && editor) {
+      const size = frame.nativeImage.getSize()
+      const x = Math.max(
+        0,
+        Math.floor(
+          (Math.min(layout.headerArea.bbox[0], layout.chatMainArea.bbox[0], editor[0]) *
+            size.width) /
+            1000
+        )
+      )
+      const crop = { x, y: 0, width: size.width - x, height: size.height }
+      this.observation.panelBbox = [(x / size.width) * 1000, 0, 1000, 1000]
+      this.observation.headerId = this.lastReplyHeader
+        ? createHash('sha256').update(this.lastReplyHeader).digest('hex')
+        : undefined
+      // Only the editable region, independent of newly appended history messages.
+      this.pendingEditor = this.captureEditor(frame.nativeImage)
+      this.observation.editorId = this.pendingEditor
+        ? createHash('sha256').update(this.pendingEditor).digest('hex')
+        : undefined
+      return frame.nativeImage.crop(crop).toDataURL()
+    }
     return frame.screenshotBase64
   }
 
@@ -259,8 +289,72 @@ export class RPADevice implements DesktopDevice {
     return width > 0 && height > 0 ? image.crop({ x, y, width, height }) : null
   }
 
-  getCaptureContext(): 'full_window' {
-    return 'full_window'
+  getCaptureContext(): 'full_window' | 'conversation_panel' {
+    return this.panelCapture && this.observation?.panelBbox ? 'conversation_panel' : 'full_window'
+  }
+
+  async inspectPendingReply(): Promise<{
+    changed: boolean
+    screenshot?: string
+    observation?: ChatObservation
+  }> {
+    const before = this.observation
+    const beforeEditor = this.pendingEditor
+    if (!before?.headerId || !before.editorId)
+      throw new DesktopStateError('conversation_changed', '缺少发送前会话或输入框证据')
+    const screenshot = await this.screenshot()
+    const current = this.observation!
+    if (current.conversationId !== before.conversationId || current.headerId !== before.headerId)
+      throw new DesktopStateError('conversation_changed', '生成期间切换了会话或页面，取消发送')
+    if (
+      current.editorId !== before.editorId &&
+      (!beforeEditor ||
+        !this.pendingEditor ||
+        !this.onlyCaretChanged(beforeEditor, this.pendingEditor))
+    )
+      throw new DesktopStateError(
+        'conversation_changed',
+        '生成期间输入框变化，取消发送以保护人工草稿'
+      )
+    return { changed: current.historyId !== before.historyId, screenshot, observation: current }
+  }
+
+  private onlyCaretChanged(before: Buffer, after: Buffer): boolean {
+    const a = PNG.sync.read(before),
+      b = PNG.sync.read(after)
+    if (a.width !== b.width || a.height !== b.height) return false
+    let left = a.width,
+      right = -1,
+      top = a.height,
+      bottom = -1
+    for (let y = 0; y < a.height; y++)
+      for (let x = 0; x < a.width; x++) {
+        const p = (y * a.width + x) * 4
+        if (
+          Math.max(
+            Math.abs(a.data[p] - b.data[p]),
+            Math.abs(a.data[p + 1] - b.data[p + 1]),
+            Math.abs(a.data[p + 2] - b.data[p + 2])
+          ) > 8
+        ) {
+          left = Math.min(left, x)
+          right = Math.max(right, x)
+          top = Math.min(top, y)
+          bottom = Math.max(bottom, y)
+        }
+      }
+    return right < 0 || (right - left <= 3 && bottom - top <= 40)
+  }
+
+  private captureEditor(image: Electron.NativeImage): Buffer | undefined {
+    const box = getLayoutCache(this.appType)?.messageInputArea?.bbox
+    if (!box) return undefined
+    const size = image.getSize(),
+      x = Math.max(0, Math.floor((box[0] * size.width) / 1000)),
+      y = Math.max(0, Math.floor((box[1] * size.height) / 1000))
+    const width = Math.min(size.width, Math.ceil((box[2] * size.width) / 1000)) - x,
+      height = Math.min(size.height, Math.ceil((box[3] * size.height) / 1000)) - y
+    return width > 0 && height > 0 ? image.crop({ x, y, width, height }).toPNG() : undefined
   }
 
   private captureReplyHeader(image: Electron.NativeImage): Buffer | null {
@@ -401,13 +495,19 @@ export class RPADevice implements DesktopDevice {
 
   // ── 动作层 ──
 
-  async sendMessage(text: string): Promise<void> {
+  async sendMessage(text: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
     await this.ensureLayout()
     if (this.lastReplyHeader) {
       clearScreenshotCache()
       const frame = await captureWechatWindow(this.appType)
       if (!frame.success || !frame.nativeImage)
         throw new DesktopStateError('target_unavailable', '发送前无法确认目标聊天窗口')
+      if (this.panelCapture && this.pendingEditor) {
+        const editor = this.captureEditor(frame.nativeImage)
+        if (!editor || !this.onlyCaretChanged(this.pendingEditor, editor))
+          throw new DesktopStateError('conversation_changed', '发送前检测到人工草稿，已取消发送')
+      }
       const currentHeader = this.captureReplyHeader(frame.nativeImage)
       if (
         !currentHeader ||
@@ -435,14 +535,15 @@ export class RPADevice implements DesktopDevice {
       ) {
         clearChatBaselineFn()
         throw new DesktopStateError(
-          'conversation_changed',
+          this.panelCapture ? 'history_changed' : 'conversation_changed',
           '模型分析期间聊天内容已改变，已取消旧回复并重新识别最新消息'
         )
       }
     }
     let success: boolean
     try {
-      success = await sendReplyAction(this.appType, text)
+      signal?.throwIfAborted()
+      success = await sendReplyAction(this.appType, text, signal)
     } catch (error: unknown) {
       if (isDesktopStateError(error) && error.code === 'layout_invalid') {
         clearLayoutCache(this.appType)

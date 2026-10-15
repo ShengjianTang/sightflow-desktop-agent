@@ -24,7 +24,8 @@ test('saved settings take precedence over the process environment without exposi
   assert.deepEqual(status, {
     configured: true,
     environmentConfigured: true,
-    model: 'Qwen/saved-model'
+    model: 'Qwen/saved-model',
+    replyModel: 'Qwen/saved-model'
   })
   assert.doesNotMatch(JSON.stringify(status), /test-only/)
   const seen = []

@@ -138,10 +138,15 @@ export class ReplyGuard {
     if (text && state?.pending.length) this.record(text, observation)
   }
 
-  record(text: string, observation?: ChatObservation, evidence: ReplyEvidence = {}): void {
+  record(
+    text: string,
+    observation?: ChatObservation,
+    evidence: ReplyEvidence = {},
+    answeredBatch?: ConversationMessage[]
+  ): void {
     this.remember(evidence, observation)
     const state = this.state(observation?.conversationId || 'unknown')
-    const incoming = state.pending
+    const incoming = answeredBatch || state.pending
     state.history = mergeMessageSequence(state.history, incoming)
     state.history = [
       ...state.history,

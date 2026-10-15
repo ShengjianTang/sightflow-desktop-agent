@@ -43,7 +43,23 @@ export interface TraceOutcome {
   latencyMs?: number
 }
 
+/** Timing metadata contains no message text, screenshots or credentials. */
+export interface ReplyTiming {
+  batchId?: string
+  stage:
+    | 'detect'
+    | 'capture'
+    | 'reply_request'
+    | 'reply_review'
+    | 'presend'
+    | 'send'
+    | 'batch_total'
+  model?: string
+  code: string
+}
+
 export interface TraceStep {
+  performance?: ReplyTiming
   stepId: string
   sessionId: string
   seq: number
@@ -64,6 +80,7 @@ export interface TraceStep {
  * 截图以 base64 传入，由 recorder 落盘并替换为相对路径。
  */
 export interface TraceStepInput {
+  performance?: ReplyTiming
   actor?: TraceActor
   phase: TracePhase
   summary: string

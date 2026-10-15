@@ -129,7 +129,8 @@ export async function sendReplyByCoordsAction(
   x: number,
   y: number,
   text: string,
-  assertFocused?: () => void
+  assertFocused?: () => void,
+  signal?: AbortSignal
 ): Promise<boolean> {
   const robot = getRobot()
   if (!robot) {
@@ -138,6 +139,12 @@ export async function sendReplyByCoordsAction(
   }
 
   let sendPhase: 'before_paste' | 'pasted' | 'submitted' = 'before_paste'
+  const focused = assertFocused
+  assertFocused = () => {
+    if (signal?.aborted)
+      throw new DesktopStateError('send_failed', '引擎已停止，取消发送', sendPhase)
+    focused?.()
+  }
   try {
     assertFocused?.()
     await humanLikeMove(x, y)
@@ -194,7 +201,11 @@ export async function sendReplyByCoordsAction(
  * 业务原子 2：极简防检测回复模式（VLM 路线适配器）。
  * 从 layout cache 中找输入框坐标并检查窗口范围，最终调用 `sendReplyByCoordsAction`。
  */
-export async function sendReplyAction(appType: AppType, text: string): Promise<boolean> {
+export async function sendReplyAction(
+  appType: AppType,
+  text: string,
+  signal?: AbortSignal
+): Promise<boolean> {
   const windowInfo = await getWindowInfo(appType, false, true)
   if (!windowInfo || !windowInfo.bounds) {
     console.error('[sendReplyAction] 无法获取窗口信息')
@@ -235,7 +246,7 @@ export async function sendReplyAction(appType: AppType, text: string): Promise<b
     )
   }
 
-  return sendReplyByCoordsAction(inputX, inputY, text, assertFocused)
+  return sendReplyByCoordsAction(inputX, inputY, text, assertFocused, signal)
 }
 
 function isInputPointInsideWindow(

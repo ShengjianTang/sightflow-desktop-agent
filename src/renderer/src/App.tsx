@@ -134,6 +134,7 @@ interface AppSettings {
   siliconFlow: {
     apiKey: string
     model: string
+    replyModel?: string
   }
   chatProvider: {
     manifestUrl: string
@@ -200,6 +201,13 @@ const BUILTIN_PROVIDER_CATALOG: ProviderCatalogItem[] = [
           required: true,
           defaultValue: SILICONFLOW_DEFAULT_MODEL,
           hint: '填写硅基流动平台可用且支持图片输入的模型 ID；不能直接填写火山方舟的豆包 ID'
+        },
+        {
+          key: 'replyModel',
+          label: '回复模型（留空跟随视觉模型）',
+          type: 'text',
+          defaultValue: '',
+          hint: '仅用于自动回复与发送前复核；不改变定位和图片工具使用的视觉模型'
         }
       ]
     }
@@ -935,6 +943,7 @@ function AgentPanel(): React.JSX.Element {
     configured: boolean
     environmentConfigured: boolean
     model: string
+    replyModel: string
   } | null>(null)
   const [catalogError, setCatalogError] = useState('')
   const selectedProvider = catalog.find((provider) => provider.id === selectedId) || catalog[0]
@@ -957,6 +966,7 @@ function AgentPanel(): React.JSX.Element {
           configured: boolean
           environmentConfigured: boolean
           model: string
+          replyModel: string
         }>
       ])
       setSiliconFlow(siliconStatus || null)
@@ -1007,6 +1017,7 @@ function AgentPanel(): React.JSX.Element {
           ...getProviderDefaults(BUILTIN_PROVIDER_CATALOG[1]),
           apiKey: settings?.siliconFlow?.apiKey ?? '',
           model: settings?.siliconFlow?.model || siliconStatus?.model || SILICONFLOW_DEFAULT_MODEL,
+          replyModel: settings?.siliconFlow?.replyModel || '',
           ...(prev[SILICONFLOW_PROVIDER_ID] || {})
         },
         ...(nextActiveId !== 'doubao' && nextActiveId !== SILICONFLOW_PROVIDER_ID
@@ -1112,7 +1123,11 @@ function AgentPanel(): React.JSX.Element {
           return false
         }
         await window.electron?.invoke('settings:set', {
-          siliconFlow: { apiKey, model: String(values.model || '').trim() },
+          siliconFlow: {
+            apiKey,
+            model: String(values.model || '').trim(),
+            replyModel: String(values.replyModel || '').trim()
+          },
           chatProvider: {
             manifestUrl: 'builtin://siliconflow',
             installed: {
@@ -1296,7 +1311,7 @@ function AgentPanel(): React.JSX.Element {
               {selectedProvider.id === SILICONFLOW_PROVIDER_ID ? (
                 <div className="form-hint" role="status">
                   {siliconFlow?.configured
-                    ? `已配置；当前视觉模型：${siliconFlow.model}`
+                    ? `已配置；定位模型：${siliconFlow.model}；回复模型：${siliconFlow.replyModel}`
                     : '请填写硅基流动 API Key，或设置 SILICONFLOW_API_KEY'}
                 </div>
               ) : null}
@@ -1417,6 +1432,7 @@ function getProviderValues(
       ...defaults,
       apiKey: settings?.siliconFlow?.apiKey ?? '',
       model: settings?.siliconFlow?.model || defaults.model,
+      replyModel: settings?.siliconFlow?.replyModel || '',
       ...(drafts[provider.id] || {})
     }
   }

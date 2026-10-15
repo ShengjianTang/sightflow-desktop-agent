@@ -8,6 +8,18 @@ export interface ChatObservation {
   chatAreaBbox?: BBox
   /** Local pixel evidence, when a standard right-aligned outgoing bubble is visible. */
   outgoingBubbleBottom?: number
+  /** Crop in full-window normalized coordinates; model evidence is mapped back. */
+  panelBbox?: BBox
+  headerId?: string
+  editorId?: string
+}
+
+export interface ReplyBatch {
+  id: string
+  conversationId: string
+  messages: ConversationMessage[]
+  afterReply: string
+  beforeReply: ConversationMessage[]
 }
 
 export interface ConversationMessage {
@@ -21,6 +33,8 @@ export interface VisibleChatMessage extends ConversationMessage {
 }
 
 export interface ReplyEvidence {
+  /** Full transcript behind a host-approved pending batch (internal provider only). */
+  observedMessages?: VisibleChatMessage[]
   latestMessage?: string
   sender?: 'incoming' | 'self' | 'unknown'
   /** Latest message sender's avatar, normalized to this screenshot (0-1000). */
@@ -34,7 +48,10 @@ export interface ProviderInput {
   appType: AppType
   currentContact?: string
   ocrText?: string
-  captureContext?: 'full_window' | 'chat_area'
+  captureContext?: 'full_window' | 'chat_area' | 'conversation_panel'
+  batchId?: string
+  pendingBatch?: ReplyBatch
+  signal?: AbortSignal
   observation?: ChatObservation
   recentSentMessages?: string[]
   conversationHistory?: ConversationMessage[]
@@ -43,7 +60,7 @@ export interface ProviderInput {
   memoryCards?: MemoryCardBrief[]
 }
 
-export type ProviderEvent =
+export type ProviderEvent = (
   | { type: 'thinking'; content: string }
   | ({ type: 'reply_text'; content: string } & ReplyEvidence)
   | {
@@ -53,8 +70,10 @@ export type ProviderEvent =
       category?: 'self' | 'system' | 'non_chat' | 'uncertain' | 'draft' | 'empty_chat'
     }
   | { type: 'error'; error: string }
+  | { type: 'metric'; stage: string; latencyMs: number; model: string; code: string }
+) & { batchId?: string }
 
-export type SessionEvent =
+export type SessionEvent = (
   | { type: 'bootstrap' }
   | { type: 'observe_chat' }
   | { type: 'provider.thinking'; content: string; observationId?: number }
@@ -67,17 +86,39 @@ export type SessionEvent =
       observationId?: number
     }
   | { type: 'provider.error'; error: string; observationId?: number }
+  | {
+      type: 'provider.metric'
+      stage: string
+      latencyMs: number
+      model: string
+      code: string
+      observationId?: number
+    }
+  | { type: 'retry_batch_send'; batchId: string }
   | { type: 'check_unread' }
   | { type: 'wait_retry'; reason?: string; delayMs?: number; detail?: string }
+) & { batchId?: string }
+
+export interface PendingReplyReview extends ProviderInput {
+  previousMessages: VisibleChatMessage[]
+}
+export interface PendingReplyReviewResult {
+  safe: boolean
+  code: string
+  messages?: VisibleChatMessage[]
+  appended?: VisibleChatMessage[]
+}
 
 export interface ProviderAdapter {
   run(input: ProviderInput): AsyncIterable<ProviderEvent>
+  reviewPendingReply?(input: PendingReplyReview): Promise<PendingReplyReviewResult>
 }
 
 export interface RuntimeHostControls {
   enqueue(event: SessionEvent): void
   schedule(event: SessionEvent, delayMs: number): void
   runProvider(input: ProviderInput): AsyncIterable<ProviderEvent>
+  reviewPendingReply?(input: PendingReplyReview): Promise<PendingReplyReviewResult>
   log(type: 'thinking' | 'reply' | 'skip' | 'error', content: string): void
   /** 记录一条结构化工作轨迹（work-trace）。无 recorder 时为 no-op。 */
   trace(step: TraceStepInput): void

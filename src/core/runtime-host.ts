@@ -97,6 +97,11 @@ export class RuntimeHost<TState> {
       enqueue: (event) => this.enqueue(event),
       schedule: (event, delayMs) => this.schedule(event, delayMs),
       runProvider: (input: ProviderInput) => this.runProviderWithMemory(input),
+      ...(this.options.provider.reviewPendingReply
+        ? {
+            reviewPendingReply: (input) => this.options.provider.reviewPendingReply!(input)
+          }
+        : {}),
       log: (type, content) => this.log(type, content),
       trace: (step) => this.trace(step),
       isRunning: () => this.running,

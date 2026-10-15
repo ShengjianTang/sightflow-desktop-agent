@@ -8,11 +8,14 @@
 import { DesktopDevice } from './device'
 import { isDesktopStateError } from './desktop-errors'
 import { ReplyGuard } from './reply-guard'
+import { incomingTail, messageSequenceError, sameMessage } from './chat-messages'
 import {
   ChannelContext,
   ChannelSession,
   ChatObservation,
   ProviderEvent,
+  ReplyBatch,
+  VisibleChatMessage,
   SessionEvent
 } from './session-types'
 
@@ -40,10 +43,35 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
   private observationVersion = 0
   private completedObservationVersion = -1
   private providerInFlight = false
+  private request: AbortController | undefined
+  private batchId: string | undefined
+  private batchSequence = 0
+  private batchStartedAt = 0
+  private replyModel: string | undefined
+  private readonly pendingBatches = new Map<string, ReplyBatch>()
+  private pendingInput: ReplyBatch | undefined
+  private readyReply:
+    | {
+        event: Extract<SessionEvent, { type: 'provider.reply_text' }>
+        observation: ChatObservation
+        transcript: VisibleChatMessage[]
+        appended: VisibleChatMessage[]
+        currentTranscript: VisibleChatMessage[]
+        attempts: number
+      }
+    | undefined
 
   constructor(private readonly device: DesktopDevice) {}
 
   async onStart(ctx: ChannelContext<GenericChannelState>): Promise<void> {
+    this.request?.abort()
+    this.pendingBatches.clear()
+    this.readyReply = undefined
+    this.batchId = undefined
+    this.pendingInput = undefined
+    this.device.setReplyPanelCapture?.(
+      Boolean(ctx.host.reviewPendingReply && this.device.inspectPendingReply)
+    )
     this.device.setAppType(ctx.appType)
     this.device.clearChatBaseline()
     this.bootstrapRetryCount = 0
@@ -60,6 +88,12 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
   }
 
   async onStop(ctx: ChannelContext<GenericChannelState>): Promise<void> {
+    this.request?.abort()
+    this.request = undefined
+    this.batchId = undefined
+    this.pendingBatches.clear()
+    this.pendingInput = undefined
+    this.readyReply = undefined
     this.device.clearChatBaseline()
     this.bootstrapRetryCount = 0
     this.consecutiveUnreadFailures = 0
@@ -74,6 +108,7 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
   }
 
   async onEvent(event: SessionEvent, ctx: ChannelContext<GenericChannelState>): Promise<void> {
+    if (event.batchId && event.batchId !== this.batchId) return
     this.device.setAppType(ctx.appType)
     if (
       'observationId' in event &&
@@ -145,7 +180,12 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
       }
 
       case 'observe_chat': {
-        if (this.providerInFlight) break
+        if (this.providerInFlight || this.readyReply) break
+        this.request?.abort()
+        this.request = new AbortController()
+        this.batchId = 'batch-' + ++this.batchSequence
+        const captureStart = Date.now()
+        this.batchStartedAt = captureStart
         const observationId = ++this.observationVersion
         this.providerInFlight = true
         let screenshot: string
@@ -169,6 +209,15 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
           screenshotBase64: screenshot
         })
         this.observation = this.device.getObservationContext?.()
+        this.pendingInput = this.observation
+          ? this.pendingBatches.get(this.observation.conversationId)
+          : undefined
+        ctx.host.trace({
+          phase: 'observe',
+          summary: '截图合并完成 ' + this.batchId,
+          performance: { batchId: this.batchId, stage: 'capture', code: 'OK' },
+          outcome: { status: 'ok', latencyMs: Date.now() - captureStart }
+        })
         void this.forwardProviderEvents(screenshot, ctx, observationId, this.observation)
         break
       }
@@ -182,7 +231,53 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
         })
         break
 
+      case 'provider.metric':
+        this.replyModel = event.model
+        ctx.host.log(
+          'thinking',
+          event.stage +
+            ' ' +
+            event.latencyMs +
+            'ms [' +
+            event.code +
+            '] 模型=' +
+            event.model +
+            ' 批次=' +
+            event.batchId
+        )
+        ctx.host.trace({
+          phase: 'think',
+          summary: event.stage + ' ' + event.batchId + ' ' + event.model,
+          performance: {
+            batchId: event.batchId,
+            stage: event.stage === 'reply_review' ? 'reply_review' : 'reply_request',
+            model: event.model,
+            code: event.code
+          },
+          outcome: {
+            status: event.code === 'OK' ? 'ok' : 'skip',
+            latencyMs: event.latencyMs,
+            detail: event.code
+          }
+        })
+        break
+
+      case 'retry_batch_send': {
+        if (this.readyReply && ctx.host.isRunning()) await this.sendReadyBatch(ctx)
+        break
+      }
+
       case 'provider.reply_text': {
+        if (
+          event.batchId &&
+          this.device.getCaptureContext?.() === 'conversation_panel' &&
+          this.device.inspectPendingReply &&
+          ctx.host.reviewPendingReply &&
+          this.observation
+        ) {
+          await this.acceptBatchReply(event, ctx)
+          break
+        }
         this.skipDiffRetryUsed = false
         this.observingNonChat = false
         const blocked = this.replyGuard.rejection(event, this.observation)
@@ -203,7 +298,7 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
           )
         const sendStart = Date.now()
         try {
-          await this.device.sendMessage(event.content)
+          await this.device.sendMessage(event.content, this.request?.signal)
         } catch (error: unknown) {
           if (!isDesktopStateError(error)) throw error
           ctx.host.trace({
@@ -236,6 +331,16 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
       }
 
       case 'provider.skip':
+        if (event.category === 'empty_chat') {
+          ctx.host.log('skip', '尚未打开聊天，转回未读联系人定位，不再复核回复')
+          if (await this.openUnreadFromEmptyChat(ctx)) break
+          ctx.host.schedule({ type: 'bootstrap' }, this.retryDelayMs)
+          break
+        }
+        if (event.category === 'self') {
+          if (this.observation && this.pendingInput)
+            this.pendingBatches.delete(this.observation.conversationId)
+        }
         if (event.category === 'self')
           this.replyGuard.acknowledgeSelf(event.latestMessage, this.observation)
         this.observingNonChat = event.category === 'non_chat' || event.category === 'draft'
@@ -283,6 +388,7 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
         break
 
       case 'check_unread': {
+        const detectionStart = Date.now()
         try {
           const diffResult = await this.device.hasChatAreaChanged()
           if (diffResult.error) {
@@ -303,7 +409,8 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
             ctx.host.trace({
               phase: 'verify',
               summary: '检测到当前对话有新消息',
-              outcome: { status: 'ok' }
+              performance: { stage: 'detect', code: 'CHAT_CHANGED' },
+              outcome: { status: 'ok', latencyMs: Date.now() - detectionStart }
             })
             ctx.host.enqueue({ type: 'observe_chat' })
             break
@@ -314,6 +421,25 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
             break
           }
           if (this.observingNonChat) {
+            if (this.pendingInput && this.device.inspectPendingReply) {
+              try {
+                const changed = await this.device.inspectPendingReply()
+                if (changed.changed && ctx.host.isRunning()) {
+                  ctx.host.enqueue({ type: 'observe_chat' })
+                  break
+                }
+              } catch (error) {
+                // An editor/header change needs a new model observation, never a send.
+                if (
+                  isDesktopStateError(error) &&
+                  error.code === 'conversation_changed' &&
+                  ctx.host.isRunning()
+                ) {
+                  ctx.host.enqueue({ type: 'observe_chat' })
+                  break
+                }
+              }
+            }
             ctx.host.enqueue({
               type: 'wait_retry',
               reason: 'non_chat_page',
@@ -449,6 +575,189 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
     }
   }
 
+  private async acceptBatchReply(
+    event: Extract<SessionEvent, { type: 'provider.reply_text' }>,
+    ctx: ChannelContext<GenericChannelState>
+  ): Promise<void> {
+    this.observingNonChat = false
+    this.skipDiffRetryUsed = false
+    const observation = this.observation!
+    const pending = this.pendingInput
+    const trusted = Boolean(
+      pending &&
+      pending.conversationId === observation.conversationId &&
+      event.messages &&
+      pending.messages.every((m, i) => event.messages?.[i] && sameMessage(m, event.messages[i]))
+    )
+    const blocked = trusted
+      ? messageSequenceError(event, observation.chatAreaBbox)
+      : this.replyGuard.rejection(event, observation)
+    if (blocked || !event.messages?.length) {
+      ctx.host.log('skip', '本批未发送：' + (blocked || '缺少消息列表'))
+      await this.updateBaseline(ctx)
+      ctx.host.enqueue({ type: 'check_unread' })
+      return
+    }
+    this.readyReply = {
+      event,
+      observation,
+      transcript: event.observedMessages || event.messages,
+      currentTranscript: event.observedMessages || event.messages,
+      appended: [],
+      attempts: 0
+    }
+    await this.sendReadyBatch(ctx)
+  }
+
+  private async sendReadyBatch(ctx: ChannelContext<GenericChannelState>): Promise<void> {
+    const ready = this.readyReply
+    if (!ready) return
+    const signal = this.request?.signal
+    const active = () => ctx.host.isRunning() && !signal?.aborted && this.readyReply === ready
+    const verifyStart = Date.now()
+    let sendStart = 0
+    try {
+      const inspected = await this.device.inspectPendingReply!()
+      if (!active()) return
+      if (inspected.changed) {
+        const review = await ctx.host.reviewPendingReply!({
+          screenshot: inspected.screenshot!,
+          appType: ctx.appType,
+          captureContext: 'conversation_panel',
+          observation: inspected.observation,
+          previousMessages: ready.transcript,
+          batchId: ready.event.batchId,
+          signal
+        })
+        if (!active()) return
+        ctx.host.trace({
+          phase: 'verify',
+          summary: '发送前状态复核 ' + ready.event.batchId,
+          performance: {
+            batchId: ready.event.batchId,
+            stage: 'presend',
+            model: this.replyModel,
+            code: review.code
+          },
+          outcome: {
+            status: review.safe ? 'ok' : 'skip',
+            latencyMs: Date.now() - verifyStart,
+            detail: review.code
+          }
+        })
+        if (!review.safe || !review.messages) {
+          this.readyReply = undefined
+          ctx.host.log('skip', '本批取消发送：' + review.code)
+          if (review.code === 'MANUAL_REPLY_DETECTED')
+            this.pendingBatches.delete(ready.observation.conversationId)
+          await this.updateBaseline(ctx)
+          ctx.host.enqueue({ type: 'check_unread' })
+          return
+        }
+        ready.appended = review.appended || []
+        ready.currentTranscript = review.messages
+      }
+      if (!inspected.changed)
+        ctx.host.trace({
+          phase: 'verify',
+          summary: '发送前状态未变 ' + ready.event.batchId,
+          performance: { batchId: ready.event.batchId, stage: 'presend', code: 'UNCHANGED' },
+          outcome: { status: 'ok', latencyMs: Date.now() - verifyStart }
+        })
+      if (!active()) return
+      sendStart = Date.now()
+      await this.device.sendMessage(ready.event.content, signal)
+      if (!active()) return
+      // Acknowledge only the frozen batch, never arrivals observed during generation.
+      this.replyGuard.record(
+        ready.event.content,
+        ready.observation,
+        ready.event,
+        incomingTail(ready.event.messages!)
+      )
+      if (ready.appended.length)
+        this.pendingBatches.set(ready.observation.conversationId, {
+          id: ready.event.batchId + '-next',
+          conversationId: ready.observation.conversationId,
+          messages: ready.appended,
+          afterReply: ready.event.content,
+          beforeReply: ready.currentTranscript
+        })
+      else this.pendingBatches.delete(ready.observation.conversationId)
+      ctx.host.log('reply', ready.event.content)
+      ctx.host.trace({
+        phase: 'act',
+        summary: '发送回复 ' + ready.event.batchId,
+        performance: {
+          batchId: ready.event.batchId,
+          stage: 'send',
+          model: this.replyModel,
+          code: 'OK'
+        },
+        action: { kind: 'send' },
+        outcome: { status: 'ok', latencyMs: Date.now() - sendStart }
+      })
+      this.readyReply = undefined
+      ctx.host.trace({
+        phase: 'act',
+        summary: '批次处理完成 ' + ready.event.batchId,
+        performance: {
+          batchId: ready.event.batchId,
+          stage: 'batch_total',
+          model: this.replyModel,
+          code: 'OK'
+        },
+        outcome: { status: 'ok', latencyMs: Date.now() - this.batchStartedAt }
+      })
+      await this.updateBaseline(ctx)
+      ctx.host.enqueue({ type: ready.appended.length ? 'observe_chat' : 'check_unread' })
+    } catch (error) {
+      if (!active()) return
+      const detail = error instanceof Error ? error.message : String(error)
+      ctx.host.trace({
+        phase: 'verify',
+        summary: '本批发送未完成 ' + ready.event.batchId,
+        performance: {
+          batchId: ready.event.batchId,
+          stage: 'presend',
+          model: this.replyModel,
+          code: isDesktopStateError(error) ? error.code : 'REVIEW_FAILED'
+        },
+        outcome: {
+          status: 'fail',
+          detail: isDesktopStateError(error) ? error.code : 'REVIEW_FAILED',
+          latencyMs: Date.now() - verifyStart
+        }
+      })
+      if (isDesktopStateError(error) && error.sendPhase !== 'before_paste') {
+        this.replyGuard.record(
+          ready.event.content,
+          ready.observation,
+          ready.event,
+          incomingTail(ready.event.messages!)
+        )
+        this.pendingBatches.delete(ready.observation.conversationId)
+        this.readyReply = undefined
+        ctx.host.log('error', '可能已经粘贴或发送，本批不会自动重发')
+        await this.updateBaseline(ctx)
+        ctx.host.enqueue({ type: 'check_unread' })
+      } else if (
+        isDesktopStateError(error) &&
+        error.code === 'history_changed' &&
+        ready.attempts++ < 1
+      ) {
+        ctx.host.log('thinking', '发送前又收到消息，保留本批答案并复核新增消息')
+        ctx.host.schedule(
+          { type: 'retry_batch_send', batchId: ready.event.batchId! },
+          this.pollDelayMs
+        )
+      } else {
+        this.readyReply = undefined
+        this.waitForDesktop(ctx, detail)
+      }
+    }
+  }
+
   private async forwardProviderEvents(
     screenshot: string,
     ctx: ChannelContext<GenericChannelState>,
@@ -461,6 +770,10 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
         appType: ctx.appType,
         captureContext: this.device.getCaptureContext?.(),
         observation,
+        ...(this.device.getCaptureContext?.() === 'conversation_panel'
+          ? { batchId: this.batchId, pendingBatch: this.pendingInput }
+          : {}),
+        signal: this.request?.signal,
         recentSentMessages: this.replyGuard.recent(observation?.conversationId || 'unknown'),
         ...this.replyGuard.context(observation?.conversationId || 'unknown')
       })) {
@@ -468,10 +781,14 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
 
         const sessionEvent = this.mapProviderEvent(event)
         if (sessionEvent) {
-          ctx.host.enqueue({ ...sessionEvent, observationId } as SessionEvent)
+          ctx.host.enqueue({
+            ...sessionEvent,
+            ...(event.batchId ? { batchId: event.batchId } : {}),
+            observationId
+          } as SessionEvent)
         }
         // A Provider may emit only one terminal decision per observation.
-        if (event.type !== 'thinking') return
+        if (event.type !== 'thinking' && event.type !== 'metric') return
       }
       if (ctx.host.isRunning() && observationId === this.observationVersion)
         ctx.host.enqueue({
@@ -482,12 +799,27 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
         })
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error)
+      if (
+        !ctx.host.isRunning() ||
+        observationId !== this.observationVersion ||
+        this.request?.signal.aborted
+      )
+        return
       ctx.host.enqueue({ type: 'provider.error', error: message, observationId })
     }
   }
 
   private mapProviderEvent(event: ProviderEvent): SessionEvent | null {
     switch (event.type) {
+      case 'metric':
+        return {
+          type: 'provider.metric',
+          stage: event.stage,
+          latencyMs: event.latencyMs,
+          model: event.model,
+          code: event.code,
+          batchId: event.batchId
+        }
       case 'thinking':
         return { type: 'provider.thinking', content: event.content }
       case 'reply_text':
@@ -497,7 +829,8 @@ export class GenericChannelSession implements ChannelSession<GenericChannelState
           latestMessage: event.latestMessage,
           sender: event.sender,
           senderBbox: event.senderBbox,
-          messages: event.messages
+          messages: event.messages,
+          observedMessages: event.observedMessages
         }
       case 'skip':
         return {

@@ -7,7 +7,15 @@ export async function fetchWithTimeout<T>(
   timeoutMessage: string
 ): Promise<T> {
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  const externalSignal = init.signal
+  const abortExternal = () => controller.abort(externalSignal?.reason)
+  if (externalSignal?.aborted) abortExternal()
+  else externalSignal?.addEventListener('abort', abortExternal, { once: true })
+  let timedOut = false
+  const timer = setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, timeoutMs)
   try {
     const response = await fetch(url, { ...init, signal: controller.signal })
     if (!response.ok) {
@@ -17,10 +25,12 @@ export async function fetchWithTimeout<T>(
     }
     return await readBody(response)
   } catch (error) {
-    if (controller.signal.aborted) throw new Error(timeoutMessage)
+    if (externalSignal?.aborted) throw new DOMException('请求已取消', 'AbortError')
+    if (timedOut) throw new Error(timeoutMessage)
     throw error
   } finally {
     clearTimeout(timer)
+    externalSignal?.removeEventListener('abort', abortExternal)
   }
 }
 

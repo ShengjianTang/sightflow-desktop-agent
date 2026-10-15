@@ -123,7 +123,8 @@ test('SiliconFlow credentials and model survive provider switches without enteri
   })
   assert.deepEqual(saved.siliconFlow, {
     apiKey: 'saved-test-only',
-    model: 'Qwen/test-vision'
+    model: 'Qwen/test-vision',
+    replyModel: ''
   })
   const switched = mergeSettings(saved, {
     chatProvider: {
@@ -146,7 +147,11 @@ test('older SiliconFlow provider config migrates once to the dedicated settings 
       config: { apiKey: 'legacy-test-only', model: 'Qwen/legacy' }
     }
   })
-  assert.deepEqual(settings.siliconFlow, { apiKey: 'legacy-test-only', model: 'Qwen/legacy' })
+  assert.deepEqual(settings.siliconFlow, {
+    apiKey: 'legacy-test-only',
+    model: 'Qwen/legacy',
+    replyModel: ''
+  })
   assert.deepEqual(settings.chatProvider.config, {})
   assert.equal(mergeSettings(settings, { siliconFlow: { apiKey: '' } }).siliconFlow.apiKey, '')
 })

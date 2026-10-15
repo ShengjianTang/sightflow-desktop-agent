@@ -941,7 +941,9 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
       })
       provider = loaded.provider
     } else if (isSiliconFlow) {
-      provider = createSiliconFlowProvider(createSiliconFlowClient(siliconFlowConfig(settings)))
+      provider = createSiliconFlowProvider(
+        createSiliconFlowClient(siliconFlowConfig(settings), 'reply')
+      )
     } else {
       const installedManifest = await getInstalledProviderManifest(settings.chatProvider.installed)
       // doubao（无论是用户主动装的还是内置的）apiKey 由视觉密钥共享提供，不强校验
@@ -1003,7 +1005,7 @@ async function startEngineCore(rawConfig?: any): Promise<SkillStartResult> {
       engineVersion: app.getVersion(),
       providerId: settings.chatProvider.installed?.id ?? BUILTIN_DOUBAO_PROVIDER_ID,
       model: isSiliconFlow
-        ? siliconFlowStatus(siliconFlowConfig(settings)).model
+        ? siliconFlowStatus(siliconFlowConfig(settings)).replyModel
         : providerNeedsVisionKey
           ? settings.vision.model
           : settings.chatProvider.config?.model || FIXED_ARK_MODEL

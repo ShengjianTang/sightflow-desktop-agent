@@ -217,7 +217,8 @@ export class BoxSelectDevice implements DesktopDevice {
 
   // ── 动作层 ──
 
-  async sendMessage(text: string): Promise<void> {
+  async sendMessage(text: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
     clearScreenshotCache()
     const current = await captureChatMainArea(this.appType)
     if (!current) throw new DesktopStateError('target_unavailable', '发送前无法确认聊天内容')
@@ -229,7 +230,7 @@ export class BoxSelectDevice implements DesktopDevice {
     const inputArea = getInputAreaFromCache(this.appType)
     if (!inputArea) throw new Error('尚未测量输入框区域')
     const [x, y] = inputArea.coordinates
-    const ok = await sendReplyByCoordsAction(x, y, text)
+    const ok = await sendReplyByCoordsAction(x, y, text, undefined, signal)
     if (!ok) throw new Error('发送消息失败')
   }
 

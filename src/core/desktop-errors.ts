@@ -4,6 +4,7 @@ export type DesktopErrorCode =
   | 'layout_invalid'
   | 'not_chat'
   | 'conversation_changed'
+  | 'history_changed'
   | 'send_failed'
 
 /** An expected desktop state change; keep the engine alive and never replay a send. */

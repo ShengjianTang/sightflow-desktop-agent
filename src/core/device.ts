@@ -40,7 +40,13 @@ export interface DesktopDevice {
   /** 全窗口截图 → base64 */
   screenshot(): Promise<string>
   captureStableScreenshot?(isRunning: () => boolean): Promise<string>
-  getCaptureContext?(): 'full_window' | 'chat_area'
+  getCaptureContext?(): 'full_window' | 'chat_area' | 'conversation_panel'
+  setReplyPanelCapture?(enabled: boolean): void
+  inspectPendingReply?(): Promise<{
+    changed: boolean
+    screenshot?: string
+    observation?: ChatObservation
+  }>
   /** Identity and geometry from the exact screenshot supplied to the Provider. */
   getObservationContext?(): ChatObservation | undefined
   /** Commit the analyzed frame, so messages arriving during inference stay detectable. */
@@ -101,7 +107,7 @@ export interface DesktopDevice {
   // ── 动作层 ──
 
   /** 发送消息（clipboard paste + enter） */
-  sendMessage(text: string): Promise<void>
+  sendMessage(text: string, signal?: AbortSignal): Promise<void>
 
   /**
    * 点击红点区域激活未读消息（视觉路线）

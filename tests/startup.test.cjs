@@ -187,7 +187,8 @@ test('SiliconFlow settings save drives startup and image analysis without an Ark
   assert.deepEqual(await invoke('siliconflow:status'), {
     configured: false,
     environmentConfigured: false,
-    model: 'Qwen/Qwen3-VL-30B-A3B-Instruct'
+    model: 'Qwen/Qwen3-VL-30B-A3B-Instruct',
+    replyModel: 'Qwen/Qwen3-VL-30B-A3B-Instruct'
   })
   assert.match((await invoke('engine:start')).error, /API Key/)
 
@@ -196,7 +197,8 @@ test('SiliconFlow settings save drives startup and image analysis without an Ark
   })
   assert.deepEqual((await invoke('settings:getAll')).siliconFlow, {
     apiKey: 'saved-test-only',
-    model: 'Qwen/saved-vision'
+    model: 'Qwen/saved-vision',
+    replyModel: ''
   })
   assert.equal((await invoke('siliconflow:status')).configured, true)
   assert.equal((await invoke('siliconflow:status')).model, 'Qwen/saved-vision')
